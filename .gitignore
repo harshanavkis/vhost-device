@@ -1,4 +1,3 @@
-kcov_output/
-target/
-.vscode/
-*.swp
+/target
+Cargo.lock
+/src/vsock/target

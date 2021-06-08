@@ -1,0 +1,23 @@
+[package]
+name = "vhost-user-vsock"
+version = "0.1.0"
+authors = ["Harshavardhan Unnibhavi <harshanavkis@gmail.com>"]
+description = "A virtio-vsock device using the vhost-user protocol."
+repository = "https://github.com/rust-vmm/vhost-device"
+readme = "README.md"
+keywords = ["vhost", "vsock"]
+license = "Apache-2.0 OR BSD-3-Clause"
+edition = "2018"
+
+[dependencies]
+clap = "2.33.3"
+vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend", rev = "89fa48e000a5a1a743c00c61b16492116ac86117" }
+virtio-bindings = { version = "0.1", features = ["virtio-v5_0_0"] }
+vhost = { git = "https://github.com/rust-vmm/vhost" }
+vm-memory = "*"
+epoll = "4.3.1"
+log = "0.4.14"
+vmm-sys-util = ">=0.8.0"
+virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio" }
+byteorder = "1"
+futures = { version = "0.3", features = ["thread-pool"] }
