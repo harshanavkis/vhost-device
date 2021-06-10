@@ -5,6 +5,7 @@ extern crate vhost_user_vsock;
 
 use clap::{App, Arg};
 use option_parser::{OptionParser, OptionParserError};
+use vhost_user_vsock::start_backend_server;
 use vhost_user_vsock::VsockConfig;
 
 #[derive(Debug)]
@@ -29,17 +30,9 @@ fn main() {
         .get_matches();
 
     let backend_params = vsock_args.value_of("vsock-backend").unwrap();
-    let vsock_config = parse_args(backend_params);
+    let vsock_config = parse_args(backend_params).unwrap();
 
-    match vsock_config {
-        Ok(vsock) => println!(
-            "{}, {}, {}",
-            vsock.get_guest_cid(),
-            vsock.get_socket_path(),
-            vsock.get_uds_path()
-        ),
-        Err(e) => println!("{:?}", e),
-    };
+    start_backend_server(vsock_config);
 }
 
 fn parse_args(backend_params: &str) -> Result<VsockConfig, ParserError> {
