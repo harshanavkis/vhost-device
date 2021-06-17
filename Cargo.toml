@@ -17,3 +17,5 @@ virtio-bindings = { version = "0.1", features = ["virtio-v5_0_0"]}
 vhost = { git = "https://github.com/rust-vmm/vhost" }
 vm-memory = "*"
 epoll = "4.3.1"
+log = "0.4.14"
+vmm-sys-util = ">=0.8.0"
