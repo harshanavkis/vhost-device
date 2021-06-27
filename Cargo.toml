@@ -14,7 +14,7 @@ clap = "2"
 option_parser = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor.git" }
 vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend" }
 virtio-bindings = { version = "0.1", features = ["virtio-v5_0_0"]}
-vhost = { git = "https://github.com/rust-vmm/vhost" }
+vhost = { git = "https://github.com/rust-vmm/vhost", rev = "30ba3e7bbe9e0542cf480f44bc6845a8dbd2a6ba" }
 vm-memory = "*"
 epoll = "4.3.1"
 log = "0.4.14"

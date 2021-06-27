@@ -8,11 +8,18 @@ extern crate vm_memory;
 extern crate vmm_sys_util;
 
 use core::slice;
+use epoll::Events;
 use log::*;
+use std::collections::HashMap;
+use std::fmt;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::mem;
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::AsRawFd;
+use std::os::unix::prelude::FromRawFd;
 use std::os::unix::prelude::RawFd;
 use std::process;
 use std::result;
@@ -26,14 +33,55 @@ use vhost_user_backend::VhostUserDaemon;
 use vhost_user_backend::Vring;
 use vhost_user_backend::VringWorker;
 use virtio_bindings::bindings::virtio_blk::__u64;
+use virtio_bindings::bindings::virtio_net::VIRTIO_F_NOTIFY_ON_EMPTY;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
+use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::GuestMemoryAtomic;
 use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::eventfd::EFD_NONBLOCK;
 
+const NUM_QUEUES: usize = 2;
+const QUEUE_SIZE: usize = 256;
+
+// New descriptors pending on the rx queue
+const RX_QUEUE_EVENT: u16 = 0;
+// New descriptors are pending on the tx queue.
+const TX_QUEUE_EVENT: u16 = 1;
+// New descriptors are pending on the event queue.
+const EVT_QUEUE_EVENT: u16 = 2;
 // Notification coming from the backend.
 const BACKEND_EVENT: u16 = 3;
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+enum Error {
+    /// Failed to handle event other than EPOLLIN event
+    HandleEventNotEpollIn,
+    /// Failed to handle unknown event
+    HandleUnknownEvent,
+    /// Failed to accept new local socket connection
+    UnixAccept(std::io::Error),
+    /// Failed to create an epoll fd
+    EpollFdCreate(std::io::Error),
+    /// Failed to add to epoll
+    EpollAdd(std::io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vhost_user_vsock_error: {:?}", self)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl std::convert::From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::new(io::ErrorKind::Other, e)
+    }
+}
 
 #[derive(Debug)]
 /// This structure is the public API through which an external program
@@ -77,24 +125,55 @@ struct VhostUserVsockThread {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     event_idx: bool,
     host_sock: RawFd,
+    host_listener: UnixListener,
     kill_evt: EventFd,
     vring_worker: Option<Arc<VringWorker>>,
+    conn_map: HashMap<RawFd, VsockConnection>,
+    epoll_file: File,
 }
 
 impl VhostUserVsockThread {
-    fn new(uds_path: String) -> Self {
+    fn new(uds_path: String) -> Result<Self> {
         // TODO: better error handling
         let host_sock = UnixListener::bind(&uds_path)
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
             .unwrap();
 
-        VhostUserVsockThread {
+        let epoll_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
+        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+
+        let host_raw_fd = host_sock.as_raw_fd();
+
+        let thread = VhostUserVsockThread {
             mem: None,
             event_idx: false,
             host_sock: host_sock.as_raw_fd(),
+            host_listener: host_sock,
             kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             vring_worker: None,
-        }
+            conn_map: HashMap::new(),
+            epoll_file: epoll_file,
+        };
+
+        thread.epoll_register(host_raw_fd)?;
+
+        Ok(thread)
+    }
+
+    fn epoll_register(&self, fd: RawFd) -> Result<()> {
+        epoll::ctl(
+            self.epoll_file.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            fd,
+            epoll::Event::new(epoll::Events::EPOLLIN, fd as u64),
+        )
+        .map_err(Error::EpollAdd)?;
+
+        Ok(())
+    }
+
+    fn get_epoll_fd(&self) -> RawFd {
+        self.epoll_file.as_raw_fd()
     }
 
     fn set_vring_worker(&mut self, vring_worker: Option<Arc<VringWorker>>) {
@@ -103,11 +182,106 @@ impl VhostUserVsockThread {
             .as_ref()
             .unwrap()
             .register_listener(
-                self.host_sock,
+                self.get_epoll_fd(),
                 epoll::Events::EPOLLIN,
                 u64::from(BACKEND_EVENT),
             )
             .unwrap();
+    }
+
+    fn register_listener(&mut self, fd: RawFd, ev_type: u16) {
+        dbg!("");
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(fd, epoll::Events::EPOLLIN, u64::from(ev_type))
+            .unwrap();
+    }
+
+    fn process_backend_evt(&mut self, evset: Events) {
+        // dbg!("Processing backend event");
+
+        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
+        'epoll: loop {
+            match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
+                Ok(ev_cnt) => {
+                    for i in 0..ev_cnt {
+                        self.handle_event(
+                            epoll_events[i].data as RawFd,
+                            epoll::Events::from_bits(epoll_events[i].events).unwrap(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    warn!("failed to consume new epoll event");
+                }
+            }
+            break 'epoll;
+        }
+        // Below is a mistake
+        // I think we need to bring back nested epoll
+        // self.handle_event(self.host_sock, evset)
+    }
+
+    fn handle_event(&mut self, fd: RawFd, _evset: epoll::Events) {
+        // println!("Fd: {}", fd);
+        if fd == self.host_sock {
+            dbg!("fd==host_sock");
+            self.host_listener
+                .accept()
+                .map_err(Error::UnixAccept)
+                .and_then(|(stream, _)| {
+                    stream
+                        .set_nonblocking(true)
+                        .map(|_| stream)
+                        .map_err(Error::UnixAccept)
+                })
+                .and_then(|stream| self.add_connection(stream))
+                .unwrap_or_else(|err| {
+                    warn!("Unable to accept new local connection: {:?}", err);
+                });
+            // let stream = self.conn_map.get_mut(&fd).unwrap();
+            // let mut buf = [0 as u8; 20];
+            // stream.stream.read(&mut buf[..]).unwrap();
+            // println!("{:?}", buf);
+        } else {
+            // println!("Bitch");
+            let stream = self.conn_map.get_mut(&fd).unwrap();
+            let mut buf = [0 as u8; 20];
+            stream.stream.read(&mut buf[..]).unwrap();
+            println!("{:?}", buf);
+        }
+    }
+
+    fn add_connection(&mut self, stream: UnixStream) -> Result<()> {
+        // Create a connection object and add it to the set of connections
+        dbg!("Accepting new local connection");
+        let stream_fd = stream.as_raw_fd();
+        self.conn_map
+            .insert(stream_fd, VsockConnection::new(stream));
+        self.epoll_register(stream_fd)?;
+
+        // self.register_listener(stream_fd, BACKEND_EVENT);
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct VsockConnection {
+    stream: UnixStream,
+    connect: bool,
+}
+
+impl VsockConnection {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream: stream,
+            connect: false,
+        }
     }
 }
 
@@ -118,31 +292,35 @@ struct VhostUserVsockBackend {
 }
 
 impl VhostUserVsockBackend {
-    fn new(guest_cid: u64, uds_path: String) -> Self {
+    fn new(guest_cid: u64, uds_path: String) -> Result<Self> {
         let mut threads = Vec::new();
-        let thread = Mutex::new(VhostUserVsockThread::new(uds_path));
+        let thread = Mutex::new(VhostUserVsockThread::new(uds_path).unwrap());
         let mut queues_per_thread = Vec::new();
         queues_per_thread.push(0b11);
         threads.push(thread);
-        VhostUserVsockBackend {
+
+        Ok(Self {
             guest_cid: guest_cid,
             threads: threads,
             queues_per_thread: queues_per_thread,
-        }
+        })
     }
 }
 
 impl VhostUserBackend for VhostUserVsockBackend {
     fn num_queues(&self) -> usize {
-        2
+        NUM_QUEUES
     }
 
     fn max_queue_size(&self) -> usize {
-        128
+        QUEUE_SIZE
     }
 
     fn features(&self) -> u64 {
-        1 << VIRTIO_F_VERSION_1 | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+        // TODO: | 1 << VIRTIO_RING_F_EVENT_IDX
+        1 << VIRTIO_F_VERSION_1
+            | 1 << VIRTIO_F_NOTIFY_ON_EMPTY
+            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -167,12 +345,46 @@ impl VhostUserBackend for VhostUserVsockBackend {
 
     fn handle_event(
         &self,
-        _device_event: u16,
-        _evset: epoll::Events,
-        _vrings: &[Arc<RwLock<Vring>>],
-        _thread_id: usize,
+        device_event: u16,
+        evset: epoll::Events,
+        vrings: &[Arc<RwLock<Vring>>],
+        thread_id: usize,
     ) -> result::Result<bool, io::Error> {
-        Ok(true)
+        let mut vring_rx = vrings[0].write().unwrap();
+        let mut vring_tx = vrings[1].write().unwrap();
+        let mut work = true;
+
+        if evset != epoll::Events::EPOLLIN {
+            return Err(Error::HandleEventNotEpollIn.into());
+        }
+
+        let mut thread = self.threads[thread_id].lock().unwrap();
+
+        while work {
+            work = false;
+
+            match device_event {
+                RX_QUEUE_EVENT => {
+                    dbg!("RX_QUEUE_EVENT");
+                }
+                TX_QUEUE_EVENT => {
+                    dbg!("TX_QUEUE_EVENT");
+                }
+                EVT_QUEUE_EVENT => {
+                    dbg!("EVT_QUEUE_EVENT");
+                }
+                BACKEND_EVENT => {
+                    // dbg!("BACKEND_EVENT");
+                    thread.process_backend_evt(evset);
+                }
+                _ => {
+                    dbg!("Unknown event");
+                    return Err(Error::HandleUnknownEvent.into());
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     fn get_config(&self, _offset: u32, _size: u32) -> Vec<u8> {
@@ -193,10 +405,9 @@ impl VhostUserBackend for VhostUserVsockBackend {
 /// This is the public API through which an external program starts the
 /// vhost-user-vsock backend server.
 pub fn start_backend_server(vsock_config: VsockConfig) {
-    let vsock_backend = Arc::new(RwLock::new(VhostUserVsockBackend::new(
-        vsock_config.guest_cid,
-        vsock_config.uds_path,
-    )));
+    let vsock_backend = Arc::new(RwLock::new(
+        VhostUserVsockBackend::new(vsock_config.guest_cid, vsock_config.uds_path).unwrap(),
+    ));
 
     let listener = Listener::new(vsock_config.socket, true).unwrap();
 
