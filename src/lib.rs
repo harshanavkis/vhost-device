@@ -67,6 +67,16 @@ enum Error {
     EpollFdCreate(std::io::Error),
     /// Failed to add to epoll
     EpollAdd(std::io::Error),
+    /// Failed to read from unix stream
+    UnixRead(std::io::Error),
+    /// Failed to convert byte array to string
+    ConvertFromUtf8(std::str::Utf8Error),
+    /// Invalid vsock connection request from host
+    InvalidPortRequest,
+    /// Unable to convert string to integer
+    ParseInteger(std::num::ParseIntError),
+    /// Error reading stream port
+    ReadStreamPort(Box<Error>),
 }
 
 impl fmt::Display for Error {
@@ -221,9 +231,6 @@ impl VhostUserVsockThread {
             }
             break 'epoll;
         }
-        // Below is a mistake
-        // I think we need to bring back nested epoll
-        // self.handle_event(self.host_sock, evset)
     }
 
     fn handle_event(&mut self, fd: RawFd, _evset: epoll::Events) {
@@ -243,17 +250,55 @@ impl VhostUserVsockThread {
                 .unwrap_or_else(|err| {
                     warn!("Unable to accept new local connection: {:?}", err);
                 });
-            // let stream = self.conn_map.get_mut(&fd).unwrap();
-            // let mut buf = [0 as u8; 20];
-            // stream.stream.read(&mut buf[..]).unwrap();
-            // println!("{:?}", buf);
         } else {
-            // println!("Bitch");
             let stream = self.conn_map.get_mut(&fd).unwrap();
-            let mut buf = [0 as u8; 20];
-            stream.stream.read(&mut buf[..]).unwrap();
-            println!("{:?}", buf);
+            if stream.connect {
+            } else {
+                // Local peer is sending a "connect PORT\n" command
+                // TODO: set connect to true
+                let peer_port = Self::read_local_stream_port(&mut stream.stream).unwrap();
+                dbg!("Peer port: {}", peer_port);
+                stream.set_peer_port(peer_port);
+            }
         }
+    }
+
+    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
+        let mut buf = [0u8; 32];
+
+        // Minimum number of bytes we should be able to read
+        const MIN_READ_LEN: usize = 10;
+
+        // Read in the minimum number of bytes we can read
+        stream
+            .read_exact(&mut buf[..MIN_READ_LEN])
+            .map_err(Error::UnixRead)?;
+
+        let mut read_len = MIN_READ_LEN;
+        while buf[read_len - 1] != b'\n' && read_len < buf.len() {
+            stream
+                .read_exact(&mut buf[read_len..read_len + 1])
+                .map_err(Error::UnixRead)?;
+            read_len += 1;
+        }
+
+        let mut word_iter = std::str::from_utf8(&buf[..read_len])
+            .map_err(Error::ConvertFromUtf8)?
+            .split_whitespace();
+
+        word_iter
+            .next()
+            .ok_or(Error::InvalidPortRequest)
+            .and_then(|word| {
+                if word.to_lowercase() == "connect" {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidPortRequest)
+                }
+            })
+            .and_then(|_| word_iter.next().ok_or(Error::InvalidPortRequest))
+            .and_then(|word| word.parse::<u32>().map_err(Error::ParseInteger))
+            .map_err(|e| Error::ReadStreamPort(Box::new(e)))
     }
 
     fn add_connection(&mut self, stream: UnixStream) -> Result<()> {
@@ -274,6 +319,7 @@ impl VhostUserVsockThread {
 struct VsockConnection {
     stream: UnixStream,
     connect: bool,
+    peer_port: u32,
 }
 
 impl VsockConnection {
@@ -281,7 +327,12 @@ impl VsockConnection {
         Self {
             stream: stream,
             connect: false,
+            peer_port: 0,
         }
+    }
+
+    fn set_peer_port(&mut self, peer_port: u32) {
+        self.peer_port = peer_port;
     }
 }
 
