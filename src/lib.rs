@@ -77,6 +77,8 @@ enum Error {
     ParseInteger(std::num::ParseIntError),
     /// Error reading stream port
     ReadStreamPort(Box<Error>),
+    /// Failed to de-register fd from epoll
+    EpollRemove(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -182,6 +184,18 @@ impl VhostUserVsockThread {
         Ok(())
     }
 
+    fn epoll_unregister(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_DEL,
+            fd,
+            epoll::Event::new(epoll::Events::empty(), 0),
+        )
+        .map_err(Error::EpollRemove)?;
+
+        Ok(())
+    }
+
     fn get_epoll_fd(&self) -> RawFd {
         self.epoll_file.as_raw_fd()
     }
@@ -259,6 +273,11 @@ impl VhostUserVsockThread {
                 let peer_port = Self::read_local_stream_port(&mut stream.stream).unwrap();
                 dbg!("Peer port: {}", peer_port);
                 stream.set_peer_port(peer_port);
+
+                // Unregister stream from the epoll, register when connection is
+                // established with the guest
+                Self::epoll_unregister(self.epoll_file.as_raw_fd(), stream.stream.as_raw_fd())
+                    .unwrap();
             }
         }
     }
@@ -425,7 +444,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
                     dbg!("EVT_QUEUE_EVENT");
                 }
                 BACKEND_EVENT => {
-                    // dbg!("BACKEND_EVENT");
+                    dbg!("BACKEND_EVENT");
                     thread.process_backend_evt(evset);
                 }
                 _ => {
