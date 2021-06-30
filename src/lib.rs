@@ -25,6 +25,7 @@ use std::process;
 use std::result;
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+use std::u8;
 use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use vhost::vhost_user::message::VhostUserVirtioFeatures;
 use vhost::vhost_user::Listener;
@@ -142,6 +143,46 @@ struct VhostUserVsockThread {
     vring_worker: Option<Arc<VringWorker>>,
     conn_map: HashMap<RawFd, VsockConnection>,
     epoll_file: File,
+    rx_queue: RxQueue,
+}
+
+#[derive(Clone)]
+enum RxOps {
+    /// VSOCK_OP_REQUEST
+    Request = 0,
+}
+
+impl RxOps {
+    /// Convert enum value into bitmask
+    fn bitmask(self) -> u8 {
+        1u8 << (self as u8)
+    }
+}
+
+#[derive(Debug)]
+struct RxQueue {
+    queue: u8,
+}
+
+impl RxQueue {
+    fn new() -> Self {
+        RxQueue { queue: 0 as u8 }
+    }
+    fn enqueue(&mut self, op: RxOps) {
+        self.queue |= op.bitmask();
+    }
+
+    fn dequeue(&mut self, op: RxOps) -> bool {
+        let op_bitmask = op.bitmask();
+        let ret = self.contains(op_bitmask);
+        self.queue &= !op_bitmask;
+
+        ret
+    }
+
+    fn contains(&self, op: u8) -> bool {
+        self.queue & op != 0
+    }
 }
 
 impl VhostUserVsockThread {
@@ -165,6 +206,7 @@ impl VhostUserVsockThread {
             vring_worker: None,
             conn_map: HashMap::new(),
             epoll_file: epoll_file,
+            rx_queue: RxQueue::new(),
         };
 
         thread.epoll_register(host_raw_fd)?;
@@ -278,6 +320,10 @@ impl VhostUserVsockThread {
                 // established with the guest
                 Self::epoll_unregister(self.epoll_file.as_raw_fd(), stream.stream.as_raw_fd())
                     .unwrap();
+
+                // Add Request event to rx queue
+                self.rx_queue.enqueue(RxOps::Request);
+                println!("{:?}", self.rx_queue);
             }
         }
     }
