@@ -183,6 +183,10 @@ impl RxQueue {
     fn contains(&self, op: u8) -> bool {
         self.queue & op != 0
     }
+
+    fn pending_rx(&self) -> bool {
+        self.queue != 0
+    }
 }
 
 impl VhostUserVsockThread {
@@ -378,6 +382,14 @@ impl VhostUserVsockThread {
 
         Ok(())
     }
+
+    fn process_rx(&mut self, vring: &mut Vring, event_idx: bool) -> bool {
+        false
+    }
+
+    fn process_tx(&mut self, vring: &mut Vring, event_idx: bool) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -475,28 +487,36 @@ impl VhostUserBackend for VhostUserVsockBackend {
         }
 
         let mut thread = self.threads[thread_id].lock().unwrap();
+        let evt_idx = thread.event_idx;
 
-        while work {
-            work = false;
-
-            match device_event {
-                RX_QUEUE_EVENT => {
-                    dbg!("RX_QUEUE_EVENT");
+        match device_event {
+            RX_QUEUE_EVENT => {
+                dbg!("RX_QUEUE_EVENT");
+                if thread.rx_queue.pending_rx() {
+                    thread.process_rx(&mut vring_rx, evt_idx);
                 }
-                TX_QUEUE_EVENT => {
-                    dbg!("TX_QUEUE_EVENT");
+            }
+            TX_QUEUE_EVENT => {
+                dbg!("TX_QUEUE_EVENT");
+                work |= thread.process_tx(&mut vring_tx, evt_idx);
+                if thread.rx_queue.pending_rx() {
+                    thread.process_rx(&mut vring_rx, evt_idx);
                 }
-                EVT_QUEUE_EVENT => {
-                    dbg!("EVT_QUEUE_EVENT");
+            }
+            EVT_QUEUE_EVENT => {
+                dbg!("EVT_QUEUE_EVENT");
+            }
+            BACKEND_EVENT => {
+                dbg!("BACKEND_EVENT");
+                thread.process_backend_evt(evset);
+                work |= thread.process_tx(&mut vring_tx, evt_idx);
+                if thread.rx_queue.pending_rx() {
+                    work |= thread.process_rx(&mut vring_rx, evt_idx);
                 }
-                BACKEND_EVENT => {
-                    dbg!("BACKEND_EVENT");
-                    thread.process_backend_evt(evset);
-                }
-                _ => {
-                    dbg!("Unknown event");
-                    return Err(Error::HandleUnknownEvent.into());
-                }
+            }
+            _ => {
+                dbg!("Unknown event");
+                return Err(Error::HandleUnknownEvent.into());
             }
         }
 
