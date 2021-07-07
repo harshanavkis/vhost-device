@@ -19,3 +19,5 @@ vm-memory = "*"
 epoll = "4.3.1"
 log = "0.4.14"
 vmm-sys-util = ">=0.8.0"
+vm-virtio = { git = "https://github.com/rust-vmm/vm-virtio" }
+byteorder = "1"

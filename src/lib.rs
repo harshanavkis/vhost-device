@@ -7,10 +7,13 @@ extern crate virtio_bindings;
 extern crate vm_memory;
 extern crate vmm_sys_util;
 
+use byteorder::ByteOrder;
+use byteorder::LittleEndian;
 use core::slice;
 use epoll::Events;
 use log::*;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -37,8 +40,14 @@ use virtio_bindings::bindings::virtio_blk::__u64;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_NOTIFY_ON_EMPTY;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use vm_memory::GuestAddress;
+use vm_memory::GuestAddressSpace;
+use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryAtomic;
+use vm_memory::GuestMemoryLoadGuard;
 use vm_memory::GuestMemoryMmap;
+use vm_virtio::DescriptorChain;
+use vm_virtio::Queue;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::eventfd::EFD_NONBLOCK;
 
@@ -53,6 +62,12 @@ const TX_QUEUE_EVENT: u16 = 1;
 const EVT_QUEUE_EVENT: u16 = 2;
 // Notification coming from the backend.
 const BACKEND_EVENT: u16 = 3;
+
+// vsock packet header size when packed
+const VSOCK_PKT_HDR_SIZE: usize = 44;
+
+// Offset into the header for data length
+const HDROFF_LEN: usize = 24;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -80,6 +95,20 @@ enum Error {
     ReadStreamPort(Box<Error>),
     /// Failed to de-register fd from epoll
     EpollRemove(std::io::Error),
+    /// No memory configured
+    NoMemoryConfigured,
+    /// Unable to iterate queue
+    IterateQueue,
+    /// Missing descriptor in queue
+    QueueMissingDescriptor,
+    /// Unable to write to the descriptor
+    UnwritableDescriptor,
+    /// Small header descriptor
+    HdrDescTooSmall(u32),
+    /// Chained guest memory error
+    GuestMemoryError,
+    /// No available data
+    NoData,
 }
 
 impl fmt::Display for Error {
@@ -134,19 +163,7 @@ impl VsockConfig {
     }
 }
 
-struct VhostUserVsockThread {
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    event_idx: bool,
-    host_sock: RawFd,
-    host_listener: UnixListener,
-    kill_evt: EventFd,
-    vring_worker: Option<Arc<VringWorker>>,
-    conn_map: HashMap<RawFd, VsockConnection>,
-    epoll_file: File,
-    rx_queue: RxQueue,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum RxOps {
     /// VSOCK_OP_REQUEST
     Request = 0,
@@ -172,12 +189,24 @@ impl RxQueue {
         self.queue |= op.bitmask();
     }
 
-    fn dequeue(&mut self, op: RxOps) -> bool {
-        let op_bitmask = op.bitmask();
-        let ret = self.contains(op_bitmask);
-        self.queue &= !op_bitmask;
+    fn dequeue(&mut self) -> Option<RxOps> {
+        let op = match self.peek() {
+            Some(req) => {
+                self.queue = self.queue & (!req.clone().bitmask());
+                Some(req)
+            }
+            None => None,
+        };
 
-        ret
+        op
+    }
+
+    fn peek(&self) -> Option<RxOps> {
+        if self.contains(RxOps::Request as u8) {
+            Some(RxOps::Request)
+        } else {
+            None
+        }
     }
 
     fn contains(&self, op: u8) -> bool {
@@ -187,6 +216,161 @@ impl RxQueue {
     fn pending_rx(&self) -> bool {
         self.queue != 0
     }
+}
+
+/// Vsock packet structure implemented as a wrapper around a virtq descriptor chain:
+/// - chain head holds the packet header
+/// - optional data descriptor, only present for data packets (VSOCK_OP_RW)
+struct VsockPacket {
+    hdr: *mut u8,
+    buf: Option<*mut u8>,
+    buf_size: usize,
+}
+
+impl VsockPacket {
+    /// Create a vsock packet wrapper around a chain in the rx virtqueue.
+    /// Perform bounds checking before creating the wrapper.
+    fn from_rx_virtq_head(
+        chain: &mut DescriptorChain<GuestMemoryAtomic<GuestMemoryMmap>>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    ) -> Result<Self> {
+        // head is at 0, next is at 1, max of two descriptors
+        // head contains the packet header
+        // next contains the optional packet data
+        let mut descr_vec = Vec::with_capacity(2);
+
+        let mut num_descr = 0;
+        loop {
+            if num_descr >= 2 {
+                // Maybe this should be an error?
+                break;
+            }
+            let descr = chain.next().ok_or(Error::QueueMissingDescriptor)?;
+            if !descr.is_write_only() {
+                return Err(Error::UnwritableDescriptor);
+            }
+            num_descr += 1;
+            descr_vec.push(descr);
+        }
+
+        let head_descr = descr_vec[0];
+        let data_descr = descr_vec[1];
+
+        if head_descr.len() < VSOCK_PKT_HDR_SIZE as u32 {
+            return Err(Error::HdrDescTooSmall(head_descr.len()));
+        }
+
+        Ok(Self {
+            hdr: VsockPacket::guest_to_host_address(
+                &mem.memory(),
+                head_descr.addr(),
+                VSOCK_PKT_HDR_SIZE,
+            )
+            .ok_or(Error::GuestMemoryError)? as *mut u8,
+            buf: Some(
+                VsockPacket::guest_to_host_address(
+                    &mem.memory(),
+                    data_descr.addr(),
+                    data_descr.len() as usize,
+                )
+                .ok_or(Error::GuestMemoryError)? as *mut u8,
+            ),
+            buf_size: data_descr.len() as usize,
+        })
+    }
+
+    /// Convert an absolute address in guest address space to a host
+    /// pointer and verify that the provided size defines a valid
+    /// range withing a single memory region
+    fn guest_to_host_address(
+        mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
+        addr: GuestAddress,
+        size: usize,
+    ) -> Option<*mut u8> {
+        if mem.check_range(addr, size) {
+            Some(mem.get_host_address(addr).unwrap())
+        } else {
+            None
+        }
+    }
+
+    /// In place byte slice access to vsock packet header
+    fn hdr(&self) -> &[u8] {
+        // Safe as bound checks performed in from_*_virtq_head
+        unsafe { std::slice::from_raw_parts(self.hdr as *const u8, VSOCK_PKT_HDR_SIZE) }
+    }
+
+    /// In place mutable slice access to vsock packet header
+    fn hdr_mut(&mut self) -> &mut [u8] {
+        // Safe as bound checks performed in from_*_virtq_head
+        unsafe { std::slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
+    }
+
+    /// Size of vsock packet data, found by accessing len field
+    /// of virtio_vsock_hdr struct
+    fn len(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_LEN..])
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ConnMapKey {
+    local_port: u32,
+    peer_port: u32,
+}
+
+impl ConnMapKey {
+    fn new(local_port: u32, peer_port: u32) -> Self {
+        Self {
+            local_port,
+            peer_port,
+        }
+    }
+}
+
+struct VsockThreadBackend {
+    listener_map: HashMap<RawFd, bool>,
+    conn_map: HashMap<ConnMapKey, VsockConnection>,
+    backend_rxq: VecDeque<(u32, u32)>,
+}
+
+impl VsockThreadBackend {
+    fn new() -> Self {
+        Self {
+            listener_map: HashMap::new(),
+            conn_map: HashMap::new(),
+            backend_rxq: VecDeque::new(),
+        }
+    }
+
+    /// Checks if there are pending rx requests in the backend
+    /// rxq
+    fn pending_rx(&self) -> bool {
+        self.backend_rxq.len() != 0
+    }
+
+    /// Deliver a vsock packet to the guest vsock driver
+    ///
+    /// Returns:
+    /// - `Ok(())` if the packet was successfully filled in
+    /// - `Err(Error::NoData) if there was no available data
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
+        // Pop an event from the backend_rxq
+        // TODO: implement recv_pkt for the conn
+
+        Err(Error::NoData)
+    }
+}
+
+struct VhostUserVsockThread {
+    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    event_idx: bool,
+    host_sock: RawFd,
+    host_listener: UnixListener,
+    kill_evt: EventFd,
+    vring_worker: Option<Arc<VringWorker>>,
+    epoll_file: File,
+    thread_backend: VsockThreadBackend,
 }
 
 impl VhostUserVsockThread {
@@ -208,9 +392,8 @@ impl VhostUserVsockThread {
             host_listener: host_sock,
             kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             vring_worker: None,
-            conn_map: HashMap::new(),
             epoll_file: epoll_file,
-            rx_queue: RxQueue::new(),
+            thread_backend: VsockThreadBackend::new(),
         };
 
         thread.epoll_register(host_raw_fd)?;
@@ -306,30 +489,50 @@ impl VhostUserVsockThread {
                         .map(|_| stream)
                         .map_err(Error::UnixAccept)
                 })
-                .and_then(|stream| self.add_connection(stream))
+                .and_then(|stream| self.add_stream_listener(stream))
                 .unwrap_or_else(|err| {
                     warn!("Unable to accept new local connection: {:?}", err);
                 });
         } else {
-            let stream = self.conn_map.get_mut(&fd).unwrap();
-            if stream.connect {
+            let connected = self.thread_backend.listener_map.get_mut(&fd).unwrap();
+            if connected.clone() {
             } else {
                 // Local peer is sending a "connect PORT\n" command
                 // TODO: set connect to true
-                let peer_port = Self::read_local_stream_port(&mut stream.stream).unwrap();
+                let peer_port =
+                    Self::read_local_stream_port(&mut unsafe { UnixStream::from_raw_fd(fd) })
+                        .unwrap();
                 dbg!("Peer port: {}", peer_port);
-                stream.set_peer_port(peer_port);
+
+                let local_port = Self::allocate_local_port();
+
+                let conn_map_key = ConnMapKey::new(local_port, peer_port);
+                let mut new_vsock_conn =
+                    VsockConnection::new(unsafe { UnixStream::from_raw_fd(fd) });
+                new_vsock_conn.rx_queue.enqueue(RxOps::Request);
+
+                self.thread_backend
+                    .conn_map
+                    .insert(conn_map_key, new_vsock_conn);
+
+                self.thread_backend
+                    .backend_rxq
+                    .push_back((local_port, peer_port));
 
                 // Unregister stream from the epoll, register when connection is
                 // established with the guest
-                Self::epoll_unregister(self.epoll_file.as_raw_fd(), stream.stream.as_raw_fd())
-                    .unwrap();
+                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
 
-                // Add Request event to rx queue
-                self.rx_queue.enqueue(RxOps::Request);
-                println!("{:?}", self.rx_queue);
+                // // Add Request event to rx queue
+                // self.thread_backend.rx_queue.enqueue(RxOps::Request);
+                // println!("{:?}", self.thread_backend.rx_queue);
             }
         }
+    }
+
+    fn allocate_local_port() -> u32 {
+        // TODO: A better way of doing this, should work as a quick hack
+        0
     }
 
     fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
@@ -370,12 +573,11 @@ impl VhostUserVsockThread {
             .map_err(|e| Error::ReadStreamPort(Box::new(e)))
     }
 
-    fn add_connection(&mut self, stream: UnixStream) -> Result<()> {
+    fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
         // Create a connection object and add it to the set of connections
         dbg!("Accepting new local connection");
         let stream_fd = stream.as_raw_fd();
-        self.conn_map
-            .insert(stream_fd, VsockConnection::new(stream));
+        self.thread_backend.listener_map.insert(stream_fd, false);
         self.epoll_register(stream_fd)?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
@@ -383,12 +585,65 @@ impl VhostUserVsockThread {
         Ok(())
     }
 
-    fn process_rx(&mut self, vring: &mut Vring, event_idx: bool) -> bool {
-        false
+    fn process_rx_queue(
+        &mut self,
+        queue: &mut Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+        vring_lock: Arc<RwLock<Vring>>,
+    ) -> Result<bool> {
+        let mut used_any = false;
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        let a = atomic_mem.memory();
+
+        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
+        let mut used_count = 0 as usize;
+
+        while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
+            used_any = true;
+            let used_len =
+                match VsockPacket::from_rx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
+                    Ok(mut pkt) => {
+                        if self.thread_backend.recv_pkt(&mut pkt).is_ok() {
+                            pkt.hdr().len() + pkt.len() as usize
+                        } else {
+                            queue.go_to_previous_position();
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("vsock: RX queue error: {:?}", e);
+                        0
+                    }
+                };
+        }
+        Ok(false)
     }
 
-    fn process_tx(&mut self, vring: &mut Vring, event_idx: bool) -> bool {
-        false
+    fn process_rx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
+        let mut vring = vring_lock.write().unwrap();
+        let queue = vring.mut_queue();
+        if event_idx {
+            // To properly handle EVENT_IDX we need to keep calling
+            // process_rx_queue until it stops finding new requests
+            // on the queue, as vm-virtio's Queue implementation
+            // only checks avail_index once
+            loop {
+                queue.disable_notification().unwrap();
+                self.process_rx_queue(queue, vring_lock.clone())?;
+                if !queue.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+        }
+        Ok(false)
+    }
+
+    fn process_tx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -397,6 +652,7 @@ struct VsockConnection {
     stream: UnixStream,
     connect: bool,
     peer_port: u32,
+    rx_queue: RxQueue,
 }
 
 impl VsockConnection {
@@ -405,6 +661,7 @@ impl VsockConnection {
             stream: stream,
             connect: false,
             peer_port: 0,
+            rx_queue: RxQueue::new(),
         }
     }
 
@@ -478,9 +735,8 @@ impl VhostUserBackend for VhostUserVsockBackend {
         vrings: &[Arc<RwLock<Vring>>],
         thread_id: usize,
     ) -> result::Result<bool, io::Error> {
-        let mut vring_rx = vrings[0].write().unwrap();
-        let mut vring_tx = vrings[1].write().unwrap();
-        let mut work = true;
+        let vring_rx_lock = vrings[0].clone();
+        let vring_tx_lock = vrings[1].clone();
 
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
@@ -492,15 +748,15 @@ impl VhostUserBackend for VhostUserVsockBackend {
         match device_event {
             RX_QUEUE_EVENT => {
                 dbg!("RX_QUEUE_EVENT");
-                if thread.rx_queue.pending_rx() {
-                    thread.process_rx(&mut vring_rx, evt_idx);
+                if thread.thread_backend.pending_rx() {
+                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             TX_QUEUE_EVENT => {
                 dbg!("TX_QUEUE_EVENT");
-                work |= thread.process_tx(&mut vring_tx, evt_idx);
-                if thread.rx_queue.pending_rx() {
-                    thread.process_rx(&mut vring_rx, evt_idx);
+                thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
+                if thread.thread_backend.pending_rx() {
+                    thread.process_rx(vring_tx_lock.clone(), evt_idx)?;
                 }
             }
             EVT_QUEUE_EVENT => {
@@ -509,9 +765,9 @@ impl VhostUserBackend for VhostUserVsockBackend {
             BACKEND_EVENT => {
                 dbg!("BACKEND_EVENT");
                 thread.process_backend_evt(evset);
-                work |= thread.process_tx(&mut vring_tx, evt_idx);
-                if thread.rx_queue.pending_rx() {
-                    work |= thread.process_rx(&mut vring_rx, evt_idx);
+                thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
+                if thread.thread_backend.pending_rx() {
+                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             _ => {
