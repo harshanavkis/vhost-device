@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::mem;
+use std::num::Wrapping;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::AsRawFd;
@@ -66,8 +67,45 @@ const BACKEND_EVENT: u16 = 3;
 // vsock packet header size when packed
 const VSOCK_PKT_HDR_SIZE: usize = 44;
 
+// Offset into header for source cid
+const HDROFF_SRC_CID: usize = 0;
+
+// Offset into header for destination cid
+const HDROFF_DST_CID: usize = 8;
+
+// Offset into header for source port
+const HDROFF_SRC_PORT: usize = 16;
+
+// Offset into header for destination port
+const HDROFF_DST_PORT: usize = 20;
+
 // Offset into the header for data length
 const HDROFF_LEN: usize = 24;
+
+// Offset into header for packet type
+const HDROFF_TYPE: usize = 28;
+
+// Offset into header for operation kind
+const HDROFF_OP: usize = 30;
+
+// Offset into header for additional flags
+// only for VSOCK_OP_SHUTDOWN
+const HDROFF_FLAGS: usize = 32;
+
+// Offset into header for tx buf alloc
+const HDROFF_BUF_ALLOC: usize = 36;
+
+// Offset into header for forward count
+const HDROFF_FWD_CNT: usize = 40;
+
+// CID of the host
+const VSOCK_HOST_CID: u64 = 2;
+
+// Connection oriented packet
+const VSOCK_TYPE_STREAM: u16 = 1;
+
+// Vsock connection TX buffer capacity
+const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -311,6 +349,48 @@ impl VsockPacket {
     fn len(&self) -> u32 {
         LittleEndian::read_u32(&self.hdr()[HDROFF_LEN..])
     }
+
+    /// Set the source cid
+    fn set_src_cid(&mut self, cid: u64) -> &mut Self {
+        LittleEndian::write_u64(&mut self.hdr_mut()[HDROFF_SRC_CID..], cid);
+        self
+    }
+
+    /// Set the destination cid
+    fn set_dst_cid(&mut self, cid: u64) -> &mut Self {
+        LittleEndian::write_u64(&mut self.hdr_mut()[HDROFF_DST_CID..], cid);
+        self
+    }
+
+    /// Set source port
+    fn set_src_port(&mut self, port: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_SRC_PORT..], port);
+        self
+    }
+
+    /// Set destination port
+    fn set_dst_port(&mut self, port: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_DST_PORT..], port);
+        self
+    }
+
+    /// Set type of connection
+    fn set_type(&mut self, type_: u16) -> &mut Self {
+        LittleEndian::write_u16(&mut self.hdr_mut()[HDROFF_TYPE..], type_);
+        self
+    }
+
+    /// Set size of tx buf
+    fn set_buf_alloc(&mut self, buf_alloc: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_BUF_ALLOC..], buf_alloc);
+        self
+    }
+
+    /// Set amount of tx buf data written to stream
+    fn set_fwd_cnt(&mut self, fwd_cnt: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_FWD_CNT..], fwd_cnt);
+        self
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -375,10 +455,11 @@ struct VhostUserVsockThread {
     vring_worker: Option<Arc<VringWorker>>,
     epoll_file: File,
     thread_backend: VsockThreadBackend,
+    guest_cid: u64,
 }
 
 impl VhostUserVsockThread {
-    fn new(uds_path: String) -> Result<Self> {
+    fn new(uds_path: String, guest_cid: u64) -> Result<Self> {
         // TODO: better error handling
         let host_sock = UnixListener::bind(&uds_path)
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
@@ -398,6 +479,7 @@ impl VhostUserVsockThread {
             vring_worker: None,
             epoll_file: epoll_file,
             thread_backend: VsockThreadBackend::new(),
+            guest_cid,
         };
 
         thread.epoll_register(host_raw_fd)?;
@@ -514,9 +596,14 @@ impl VhostUserVsockThread {
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
-                let mut new_vsock_conn =
-                    VsockConnection::new(unsafe { UnixStream::from_raw_fd(fd) });
+                let mut new_vsock_conn = VsockConnection::new(
+                    unsafe { UnixStream::from_raw_fd(fd) },
+                    VSOCK_HOST_CID,
+                    local_port,
+                    self.guest_cid,
+                );
                 new_vsock_conn.rx_queue.enqueue(RxOps::Request);
+                new_vsock_conn.set_peer_port(peer_port);
 
                 self.thread_backend
                     .conn_map
@@ -664,15 +751,24 @@ struct VsockConnection {
     connect: bool,
     peer_port: u32,
     rx_queue: RxQueue,
+    local_cid: u64,
+    local_port: u32,
+    guest_cid: u64,
+    /// Total number of bytes written to stream from tx buffer
+    fwd_cnt: Wrapping<u32>,
 }
 
 impl VsockConnection {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, local_cid: u64, local_port: u32, guest_cid: u64) -> Self {
         Self {
             stream: stream,
             connect: false,
             peer_port: 0,
             rx_queue: RxQueue::new(),
+            local_cid,
+            local_port,
+            guest_cid,
+            fwd_cnt: Wrapping(0),
         }
     }
 
@@ -681,7 +777,23 @@ impl VsockConnection {
     }
 
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
+        self.init_pkt(pkt);
         Ok(())
+    }
+
+    fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
+        // Zero out the packet header
+        for b in pkt.hdr_mut() {
+            *b = 0;
+        }
+
+        pkt.set_src_cid(self.local_cid)
+            .set_dst_cid(self.guest_cid)
+            .set_src_port(self.local_port)
+            .set_dst_port(self.peer_port)
+            .set_type(VSOCK_TYPE_STREAM)
+            .set_buf_alloc(CONN_TX_BUF_SIZE)
+            .set_fwd_cnt(self.fwd_cnt.0)
     }
 }
 
@@ -694,7 +806,7 @@ struct VhostUserVsockBackend {
 impl VhostUserVsockBackend {
     fn new(guest_cid: u64, uds_path: String) -> Result<Self> {
         let mut threads = Vec::new();
-        let thread = Mutex::new(VhostUserVsockThread::new(uds_path).unwrap());
+        let thread = Mutex::new(VhostUserVsockThread::new(uds_path, guest_cid).unwrap());
         let mut queues_per_thread = Vec::new();
         queues_per_thread.push(0b11);
         threads.push(thread);
