@@ -40,14 +40,14 @@ use virtio_bindings::bindings::virtio_blk::__u64;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_NOTIFY_ON_EMPTY;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use virtio_queue::DescriptorChain;
+use virtio_queue::Queue;
 use vm_memory::GuestAddress;
 use vm_memory::GuestAddressSpace;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryAtomic;
 use vm_memory::GuestMemoryLoadGuard;
 use vm_memory::GuestMemoryMmap;
-use vm_virtio::DescriptorChain;
-use vm_virtio::Queue;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::eventfd::EFD_NONBLOCK;
 
@@ -329,9 +329,9 @@ impl ConnMapKey {
 }
 
 struct VsockThreadBackend {
-    listener_map: HashMap<RawFd, bool>,
+    listener_map: HashMap<RawFd, ConnMapKey>,
     conn_map: HashMap<ConnMapKey, VsockConnection>,
-    backend_rxq: VecDeque<(u32, u32)>,
+    backend_rxq: VecDeque<ConnMapKey>,
 }
 
 impl VsockThreadBackend {
@@ -357,6 +357,10 @@ impl VsockThreadBackend {
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
         // Pop an event from the backend_rxq
         // TODO: implement recv_pkt for the conn
+        let key = self.backend_rxq.pop_front().unwrap();
+        let conn = self.conn_map.get_mut(&key).unwrap();
+
+        conn.recv_pkt(pkt);
 
         Err(Error::NoData)
     }
@@ -477,7 +481,6 @@ impl VhostUserVsockThread {
     }
 
     fn handle_event(&mut self, fd: RawFd, _evset: epoll::Events) {
-        // println!("Fd: {}", fd);
         if fd == self.host_sock {
             dbg!("fd==host_sock");
             self.host_listener
@@ -494,17 +497,21 @@ impl VhostUserVsockThread {
                     warn!("Unable to accept new local connection: {:?}", err);
                 });
         } else {
-            let connected = self.thread_backend.listener_map.get_mut(&fd).unwrap();
-            if connected.clone() {
-            } else {
+            // Check if the stream represented by fd has already establishes a
+            // connection with the application running in the guest
+            if !self.thread_backend.listener_map.contains_key(&fd) {
+                // new connection
                 // Local peer is sending a "connect PORT\n" command
-                // TODO: set connect to true
                 let peer_port =
                     Self::read_local_stream_port(&mut unsafe { UnixStream::from_raw_fd(fd) })
                         .unwrap();
                 dbg!("Peer port: {}", peer_port);
 
                 let local_port = Self::allocate_local_port();
+
+                self.thread_backend
+                    .listener_map
+                    .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
                 let mut new_vsock_conn =
@@ -517,15 +524,19 @@ impl VhostUserVsockThread {
 
                 self.thread_backend
                     .backend_rxq
-                    .push_back((local_port, peer_port));
+                    .push_back(ConnMapKey::new(local_port, peer_port));
 
                 // Unregister stream from the epoll, register when connection is
                 // established with the guest
-                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
-
-                // // Add Request event to rx queue
-                // self.thread_backend.rx_queue.enqueue(RxOps::Request);
-                // println!("{:?}", self.thread_backend.rx_queue);
+                // Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
+            } else {
+                let key = self.thread_backend.listener_map.get(&fd).unwrap();
+                let vsock_conn = self.thread_backend.conn_map.get(&key).unwrap();
+                let connected = vsock_conn.connect;
+                if connected.clone() {
+                    // TODO: If connected add a request to the queue
+                } else {
+                }
             }
         }
     }
@@ -577,7 +588,7 @@ impl VhostUserVsockThread {
         // Create a connection object and add it to the set of connections
         dbg!("Accepting new local connection");
         let stream_fd = stream.as_raw_fd();
-        self.thread_backend.listener_map.insert(stream_fd, false);
+        // self.thread_backend.listener_map.insert(stream_fd, false);
         self.epoll_register(stream_fd)?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
@@ -667,6 +678,10 @@ impl VsockConnection {
 
     fn set_peer_port(&mut self, peer_port: u32) {
         self.peer_port = peer_port;
+    }
+
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
+        Ok(())
     }
 }
 
