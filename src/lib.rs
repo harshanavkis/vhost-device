@@ -107,6 +107,11 @@ const VSOCK_TYPE_STREAM: u16 = 1;
 // Vsock connection TX buffer capacity
 const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
+// Vsock packet operation ID
+//
+// Connection request
+const VSOCK_OP_REQUEST: u16 = 1;
+
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -147,6 +152,8 @@ enum Error {
     GuestMemoryError,
     /// No available data
     NoData,
+    /// No rx request available
+    NoRequestRx,
 }
 
 impl fmt::Display for Error {
@@ -201,7 +208,7 @@ impl VsockConfig {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum RxOps {
     /// VSOCK_OP_REQUEST
     Request = 0,
@@ -391,6 +398,12 @@ impl VsockPacket {
         LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_FWD_CNT..], fwd_cnt);
         self
     }
+
+    /// Set packet operation ID
+    fn set_op(&mut self, op: u16) -> &mut Self {
+        LittleEndian::write_u16(&mut self.hdr_mut()[HDROFF_OP..], op);
+        self
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -412,6 +425,7 @@ struct VsockThreadBackend {
     listener_map: HashMap<RawFd, ConnMapKey>,
     conn_map: HashMap<ConnMapKey, VsockConnection>,
     backend_rxq: VecDeque<ConnMapKey>,
+    stream_map: HashMap<i32, UnixStream>,
 }
 
 impl VsockThreadBackend {
@@ -420,6 +434,9 @@ impl VsockThreadBackend {
             listener_map: HashMap::new(),
             conn_map: HashMap::new(),
             backend_rxq: VecDeque::new(),
+            // Need this map to prevent connected stream from closing
+            // Need to thimk of a better solution
+            stream_map: HashMap::new(),
         }
     }
 
@@ -440,9 +457,9 @@ impl VsockThreadBackend {
         let key = self.backend_rxq.pop_front().unwrap();
         let conn = self.conn_map.get_mut(&key).unwrap();
 
-        conn.recv_pkt(pkt);
+        conn.recv_pkt(pkt)?;
 
-        Err(Error::NoData)
+        Ok(())
     }
 }
 
@@ -563,6 +580,7 @@ impl VhostUserVsockThread {
     }
 
     fn handle_event(&mut self, fd: RawFd, _evset: epoll::Events) {
+        dbg!("fd: {}", fd);
         if fd == self.host_sock {
             dbg!("fd==host_sock");
             self.host_listener
@@ -576,17 +594,18 @@ impl VhostUserVsockThread {
                 })
                 .and_then(|stream| self.add_stream_listener(stream))
                 .unwrap_or_else(|err| {
+                    println!("Unable to accept new local conn: {:?}", err);
                     warn!("Unable to accept new local connection: {:?}", err);
                 });
         } else {
             // Check if the stream represented by fd has already establishes a
             // connection with the application running in the guest
+            dbg!("Accepting new local connection");
             if !self.thread_backend.listener_map.contains_key(&fd) {
+                let mut unix_stream = self.thread_backend.stream_map.remove(&fd).unwrap();
                 // new connection
                 // Local peer is sending a "connect PORT\n" command
-                let peer_port =
-                    Self::read_local_stream_port(&mut unsafe { UnixStream::from_raw_fd(fd) })
-                        .unwrap();
+                let peer_port = Self::read_local_stream_port(&mut unix_stream).unwrap();
                 dbg!("Peer port: {}", peer_port);
 
                 let local_port = Self::allocate_local_port();
@@ -596,12 +615,8 @@ impl VhostUserVsockThread {
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
-                let mut new_vsock_conn = VsockConnection::new(
-                    unsafe { UnixStream::from_raw_fd(fd) },
-                    VSOCK_HOST_CID,
-                    local_port,
-                    self.guest_cid,
-                );
+                let mut new_vsock_conn =
+                    VsockConnection::new(unix_stream, VSOCK_HOST_CID, local_port, self.guest_cid);
                 new_vsock_conn.rx_queue.enqueue(RxOps::Request);
                 new_vsock_conn.set_peer_port(peer_port);
 
@@ -672,14 +687,14 @@ impl VhostUserVsockThread {
     }
 
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
-        // Create a connection object and add it to the set of connections
-        dbg!("Accepting new local connection");
+        dbg!("Registering new stream with epoll");
         let stream_fd = stream.as_raw_fd();
-        // self.thread_backend.listener_map.insert(stream_fd, false);
+        self.thread_backend.stream_map.insert(stream_fd, stream);
+        dbg!("stream_fd: {}", stream_fd);
         self.epoll_register(stream_fd)?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
-
+        dbg!();
         Ok(())
     }
 
@@ -696,11 +711,12 @@ impl VhostUserVsockThread {
 
         let a = atomic_mem.memory();
 
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0 as usize;
+        // let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
+        // let mut used_count = 0 as usize;
 
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
             used_any = true;
+            let head_idx = avail_desc.head_index();
             let used_len =
                 match VsockPacket::from_rx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
                     Ok(mut pkt) => {
@@ -716,8 +732,19 @@ impl VhostUserVsockThread {
                         0
                     }
                 };
+
+            let mut vring = vring_lock.write().unwrap();
+            // possible overflow in used_len
+            if vring
+                .mut_queue()
+                .add_used(head_idx, used_len as u32)
+                .is_err()
+            {
+                warn!("Could not return used descriptors to ring");
+            }
+            vring.signal_used_queue().unwrap();
         }
-        Ok(false)
+        Ok(used_any)
     }
 
     fn process_rx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
@@ -736,6 +763,7 @@ impl VhostUserVsockThread {
                 }
             }
         } else {
+            self.process_rx_queue(queue, vring_lock.clone())?;
         }
         Ok(false)
     }
@@ -778,7 +806,19 @@ impl VsockConnection {
 
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
         self.init_pkt(pkt);
-        Ok(())
+
+        let rx_op = match self.rx_queue.dequeue() {
+            Some(op) => op,
+            None => return Err(Error::NoRequestRx),
+        };
+
+        if rx_op == RxOps::Request {
+            // Locally initiated connection: new connection request
+            // TODO: set an expiry
+            pkt.set_op(VSOCK_OP_REQUEST);
+            return Ok(());
+        }
+        Err(Error::NoData)
     }
 
     fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
