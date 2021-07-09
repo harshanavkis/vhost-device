@@ -488,6 +488,7 @@ struct VhostUserVsockThread {
     thread_backend: VsockThreadBackend,
     guest_cid: u64,
     pool: ThreadPool,
+    local_port: u32,
 }
 
 impl VhostUserVsockThread {
@@ -516,6 +517,7 @@ impl VhostUserVsockThread {
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
+            local_port: 0,
         };
 
         thread.epoll_register(host_raw_fd)?;
@@ -627,7 +629,7 @@ impl VhostUserVsockThread {
                 let peer_port = Self::read_local_stream_port(&mut unix_stream).unwrap();
                 dbg!("Peer port: {}", peer_port);
 
-                let local_port = Self::allocate_local_port();
+                let local_port = self.allocate_local_port();
 
                 self.thread_backend
                     .listener_map
@@ -667,9 +669,9 @@ impl VhostUserVsockThread {
         }
     }
 
-    fn allocate_local_port() -> u32 {
-        // TODO: A better way of doing this, should work as a quick hack
-        0
+    fn allocate_local_port(&mut self) -> u32 {
+        self.local_port += 1;
+        self.local_port
     }
 
     fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
