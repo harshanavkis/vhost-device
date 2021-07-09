@@ -154,6 +154,8 @@ enum Error {
     NoData,
     /// No rx request available
     NoRequestRx,
+    /// Invalid rx queue request
+    InvalidRxRequest,
 }
 
 impl fmt::Display for Error {
@@ -208,7 +210,7 @@ impl VsockConfig {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum RxOps {
     /// VSOCK_OP_REQUEST
     Request = 0,
@@ -237,6 +239,7 @@ impl RxQueue {
     fn dequeue(&mut self) -> Option<RxOps> {
         let op = match self.peek() {
             Some(req) => {
+                dbg!("RxOps not empty");
                 self.queue = self.queue & (!req.clone().bitmask());
                 Some(req)
             }
@@ -247,7 +250,7 @@ impl RxQueue {
     }
 
     fn peek(&self) -> Option<RxOps> {
-        if self.contains(RxOps::Request as u8) {
+        if self.contains(RxOps::Request.bitmask()) {
             Some(RxOps::Request)
         } else {
             None
@@ -255,7 +258,7 @@ impl RxQueue {
     }
 
     fn contains(&self, op: u8) -> bool {
-        self.queue & op != 0
+        (self.queue & op) != 0
     }
 
     fn pending_rx(&self) -> bool {
@@ -454,6 +457,7 @@ impl VsockThreadBackend {
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
         // Pop an event from the backend_rxq
         // TODO: implement recv_pkt for the conn
+        dbg!("Thread backend: recv_pkt");
         let key = self.backend_rxq.pop_front().unwrap();
         let conn = self.conn_map.get_mut(&key).unwrap();
 
@@ -748,9 +752,11 @@ impl VhostUserVsockThread {
     }
 
     fn process_rx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
+        dbg!("Process rx");
         let mut vring = vring_lock.write().unwrap();
         let queue = vring.mut_queue();
         if event_idx {
+            dbg!("process_rx: Yes event_idx");
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests
             // on the queue, as vm-virtio's Queue implementation
@@ -763,6 +769,7 @@ impl VhostUserVsockThread {
                 }
             }
         } else {
+            dbg!("process_rx: No event_idx");
             self.process_rx_queue(queue, vring_lock.clone())?;
         }
         Ok(false)
@@ -805,19 +812,31 @@ impl VsockConnection {
     }
 
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
+        dbg!("VsockConnection: recv_pkt");
         self.init_pkt(pkt);
 
+        println!("self.rx_queue: {:?}", self.rx_queue);
         let rx_op = match self.rx_queue.dequeue() {
             Some(op) => op,
-            None => return Err(Error::NoRequestRx),
+            None => {
+                dbg!("");
+                return Err(Error::NoRequestRx);
+            }
         };
 
-        if rx_op == RxOps::Request {
-            // Locally initiated connection: new connection request
-            // TODO: set an expiry
-            pkt.set_op(VSOCK_OP_REQUEST);
-            return Ok(());
+        dbg!("rx_op: {:?}", rx_op);
+
+        match rx_op {
+            RxOps::Request => {
+                dbg!("RxOps::Request");
+                pkt.set_op(VSOCK_OP_REQUEST);
+                return Ok(());
+            }
+            _ => {
+                return Err(Error::InvalidRxRequest);
+            }
         }
+
         Err(Error::NoData)
     }
 
@@ -934,6 +953,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
                 thread.process_backend_evt(evset);
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
+                    dbg!("BACKEND_EVENT: pending_rx");
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
