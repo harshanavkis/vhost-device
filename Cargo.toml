@@ -21,3 +21,4 @@ log = "0.4.14"
 vmm-sys-util = ">=0.8.0"
 virtio-queue = { git = "https://github.com/rust-vmm/vm-virtio" }
 byteorder = "1"
+futures = { version = "0.3", features = ["thread-pool"] }

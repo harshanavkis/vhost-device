@@ -11,6 +11,8 @@ use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use core::slice;
 use epoll::Events;
+use futures::executor::ThreadPool;
+use futures::executor::ThreadPoolBuilder;
 use log::*;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -29,6 +31,7 @@ use std::process;
 use std::result;
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::u8;
 use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use vhost::vhost_user::message::VhostUserVirtioFeatures;
@@ -107,6 +110,9 @@ const VSOCK_TYPE_STREAM: u16 = 1;
 // Vsock connection TX buffer capacity
 const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
+// Thread pool size
+const THREAD_POOL_SIZE: usize = 1;
+
 // Vsock packet operation ID
 //
 // Connection request
@@ -156,6 +162,8 @@ enum Error {
     NoRequestRx,
     /// Invalid rx queue request
     InvalidRxRequest,
+    /// Unable to create thread pool
+    CreateThreadPool(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -409,7 +417,7 @@ impl VsockPacket {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Debug)]
 struct ConnMapKey {
     local_port: u32,
     peer_port: u32,
@@ -458,7 +466,9 @@ impl VsockThreadBackend {
         // Pop an event from the backend_rxq
         // TODO: implement recv_pkt for the conn
         dbg!("Thread backend: recv_pkt");
+        println!("{:?}", self.backend_rxq);
         let key = self.backend_rxq.pop_front().unwrap();
+        println!("Length of self.backend_rxq: {}", self.backend_rxq.len());
         let conn = self.conn_map.get_mut(&key).unwrap();
 
         conn.recv_pkt(pkt)?;
@@ -477,6 +487,7 @@ struct VhostUserVsockThread {
     epoll_file: File,
     thread_backend: VsockThreadBackend,
     guest_cid: u64,
+    pool: ThreadPool,
 }
 
 impl VhostUserVsockThread {
@@ -501,6 +512,10 @@ impl VhostUserVsockThread {
             epoll_file: epoll_file,
             thread_backend: VsockThreadBackend::new(),
             guest_cid,
+            pool: ThreadPoolBuilder::new()
+                .pool_size(1)
+                .create()
+                .map_err(Error::CreateThreadPool)?,
         };
 
         thread.epoll_register(host_raw_fd)?;
@@ -632,6 +647,11 @@ impl VhostUserVsockThread {
                     .backend_rxq
                     .push_back(ConnMapKey::new(local_port, peer_port));
 
+                dbg!(
+                    "new element added to backend_rxq: {:?}",
+                    &self.thread_backend.backend_rxq
+                );
+
                 // Unregister stream from the epoll, register when connection is
                 // established with the guest
                 // Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
@@ -713,13 +733,13 @@ impl VhostUserVsockThread {
             None => return Err(Error::NoMemoryConfigured),
         };
 
-        let a = atomic_mem.memory();
-
-        // let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        // let mut used_count = 0 as usize;
-
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
+            if !self.thread_backend.pending_rx() {
+                break;
+            }
             used_any = true;
+            let atomic_mem = atomic_mem.clone();
+
             let head_idx = avail_desc.head_index();
             let used_len =
                 match VsockPacket::from_rx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
@@ -737,16 +757,20 @@ impl VhostUserVsockThread {
                     }
                 };
 
-            let mut vring = vring_lock.write().unwrap();
-            // possible overflow in used_len
-            if vring
-                .mut_queue()
-                .add_used(head_idx, used_len as u32)
-                .is_err()
-            {
-                warn!("Could not return used descriptors to ring");
-            }
-            vring.signal_used_queue().unwrap();
+            let vring_lock = vring_lock.clone();
+
+            // TODO: Support event idx
+            self.pool.spawn_ok(async move {
+                let mut vring = vring_lock.write().unwrap();
+                if vring
+                    .mut_queue()
+                    .add_used(head_idx, used_len as u32)
+                    .is_err()
+                {
+                    warn!("Could not return used descriptors to ring");
+                }
+                vring.signal_used_queue().unwrap();
+            });
         }
         Ok(used_any)
     }
@@ -816,24 +840,24 @@ impl VsockConnection {
         self.init_pkt(pkt);
 
         println!("self.rx_queue: {:?}", self.rx_queue);
-        let rx_op = match self.rx_queue.dequeue() {
-            Some(op) => op,
-            None => {
-                dbg!("");
-                return Err(Error::NoRequestRx);
-            }
-        };
+        // let rx_op = match self.rx_queue.dequeue() {
+        //     Some(op) => op,
+        //     None => {
+        //         dbg!("");
+        //         return Err(Error::NoRequestRx);
+        //     }
+        // };
 
-        dbg!("rx_op: {:?}", rx_op);
+        // dbg!("rx_op: {:?}", rx_op);
 
-        match rx_op {
-            RxOps::Request => {
+        match self.rx_queue.dequeue() {
+            Some(RxOps::Request) => {
                 dbg!("RxOps::Request");
                 pkt.set_op(VSOCK_OP_REQUEST);
                 return Ok(());
             }
             _ => {
-                return Err(Error::InvalidRxRequest);
+                return Err(Error::NoRequestRx);
             }
         }
 
