@@ -760,18 +760,36 @@ impl VhostUserVsockThread {
                 };
 
             let vring_lock = vring_lock.clone();
+            let event_idx = self.event_idx;
 
-            // TODO: Support event idx
             self.pool.spawn_ok(async move {
                 let mut vring = vring_lock.write().unwrap();
-                if vring
-                    .mut_queue()
-                    .add_used(head_idx, used_len as u32)
-                    .is_err()
-                {
-                    warn!("Could not return used descriptors to ring");
+                if event_idx {
+                    let queue = vring.mut_queue();
+                    if queue.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match queue.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring
+                        .mut_queue()
+                        .add_used(head_idx, used_len as u32)
+                        .is_err()
+                    {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
                 }
-                vring.signal_used_queue().unwrap();
             });
         }
         Ok(used_any)
@@ -914,9 +932,9 @@ impl VhostUserBackend for VhostUserVsockBackend {
     }
 
     fn features(&self) -> u64 {
-        // TODO: | 1 << VIRTIO_RING_F_EVENT_IDX
         1 << VIRTIO_F_VERSION_1
             | 1 << VIRTIO_F_NOTIFY_ON_EMPTY
+            | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
