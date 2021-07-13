@@ -234,6 +234,8 @@ impl VsockConfig {
 enum RxOps {
     /// VSOCK_OP_REQUEST
     Request = 0,
+    /// VSOCK_OP_RW
+    Rw = 1,
 }
 
 impl RxOps {
@@ -271,7 +273,10 @@ impl RxQueue {
 
     fn peek(&self) -> Option<RxOps> {
         if self.contains(RxOps::Request.bitmask()) {
-            Some(RxOps::Request)
+            return Some(RxOps::Request);
+        }
+        if self.contains(RxOps::Rw.bitmask()) {
+            Some(RxOps::Rw)
         } else {
             None
         }
@@ -549,7 +554,7 @@ impl VsockPacket {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, Debug)]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
 struct ConnMapKey {
     local_port: u32,
     peer_port: u32,
@@ -837,17 +842,20 @@ impl VhostUserVsockThread {
             } else {
                 dbg!("Previously connected connection");
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
-                let vsock_conn = self.thread_backend.conn_map.get(&key).unwrap();
+                let vsock_conn = self.thread_backend.conn_map.get_mut(&key).unwrap();
 
                 // TODO: This probably always evaluates to true in this block
                 let connected = vsock_conn.connect;
                 if connected.clone() {
-                    // TODO: If connected add a request to the queue
-                    dbg!("New connection connected!!");
-
                     // Unregister stream from the epoll, register when connection is
                     // established with the guest
                     Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
+
+                    // Enqueue a read request
+                    vsock_conn.rx_queue.enqueue(RxOps::Rw);
+                    self.thread_backend
+                        .backend_rxq
+                        .push_back(ConnMapKey::new(vsock_conn.local_port, vsock_conn.peer_port));
                 } else {
                 }
             }
@@ -920,6 +928,9 @@ impl VhostUserVsockThread {
             None => return Err(Error::NoMemoryConfigured),
         };
 
+        // TODO: Understand if next_avail is incremented properly
+        dbg!("Rx Queue: {:?}", queue.clone());
+
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
             if !self.thread_backend.pending_rx() {
                 break;
@@ -991,9 +1002,18 @@ impl VhostUserVsockThread {
             // on the queue, as vm-virtio's Queue implementation
             // only checks avail_index once
             loop {
+                if !self.thread_backend.pending_rx() {
+                    dbg!("process_rx: no pending rx");
+                    break;
+                }
                 queue.disable_notification().unwrap();
-                self.process_rx_queue(queue, vring_lock.clone())?;
+                // TODO: This should not even occur as pending_rx is checked before
+                // calling this function, figure out why
+                let work = self.process_rx_queue(queue, vring_lock.clone())?;
                 if !queue.enable_notification().unwrap() {
+                    break;
+                }
+                if !work {
                     break;
                 }
             }
@@ -1154,6 +1174,9 @@ impl VsockConnection {
                 dbg!("RxOps::Request");
                 pkt.set_op(VSOCK_OP_REQUEST);
                 return Ok(());
+            }
+            Some(RxOps::Rw) => {
+                dbg!("RxOps::Rw");
             }
             _ => {
                 return Err(Error::NoRequestRx);
