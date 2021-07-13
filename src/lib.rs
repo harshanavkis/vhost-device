@@ -32,6 +32,9 @@ use std::result;
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::u16;
+use std::u32;
+use std::u64;
 use std::u8;
 use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use vhost::vhost_user::message::VhostUserVirtioFeatures;
@@ -44,6 +47,7 @@ use virtio_bindings::bindings::virtio_blk::__u64;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_NOTIFY_ON_EMPTY;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use virtio_queue::Descriptor;
 use virtio_queue::DescriptorChain;
 use virtio_queue::Queue;
 use vm_memory::GuestAddress;
@@ -117,6 +121,10 @@ const THREAD_POOL_SIZE: usize = 1;
 //
 // Connection request
 const VSOCK_OP_REQUEST: u16 = 1;
+// Connection response
+const VSOCK_OP_RESPONSE: u16 = 2;
+// Connection reset
+const VSOCK_OP_RST: u16 = 3;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -164,6 +172,10 @@ enum Error {
     InvalidRxRequest,
     /// Unable to create thread pool
     CreateThreadPool(std::io::Error),
+    /// Unable to read from descriptor
+    UnreadableDescriptor,
+    /// Data buffer size less than size in packet header
+    DataDescTooSmall,
 }
 
 impl fmt::Display for Error {
@@ -335,6 +347,91 @@ impl VsockPacket {
         })
     }
 
+    // Create a vsock packet wrapper around a chain the tx virtqueue
+    // Bounds checking before creating the wrapper
+    fn from_tx_virtq_head(
+        chain: &mut DescriptorChain<GuestMemoryAtomic<GuestMemoryMmap>>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    ) -> Result<Self> {
+        // head is at 0, next is at 1, max of two descriptors
+        // head contains the packet header
+        // next contains the optional packet data
+        let mut descr_vec = Vec::with_capacity(2);
+        let mut num_descr = 0;
+
+        dbg!("Reading tx_virtqueue_head into packet");
+
+        loop {
+            if num_descr >= 2 {
+                // TODO: Turn this into an error
+                break;
+            }
+            // let descr = chain.next().ok_or(Error::QueueMissingDescriptor)?;
+
+            let descr = match chain.next() {
+                Some(descr) => descr,
+                None => break,
+            };
+
+            // All buffers in the tx queue must be readable only
+            if descr.is_write_only() {
+                return Err(Error::UnreadableDescriptor);
+            }
+            num_descr += 1;
+            descr_vec.push(descr);
+        }
+
+        let head_descr = descr_vec[0];
+
+        if head_descr.len() < VSOCK_PKT_HDR_SIZE as u32 {
+            return Err(Error::HdrDescTooSmall(head_descr.len()));
+        }
+
+        dbg!("Reading tx_virtqueue_head into packet: header len ok");
+
+        let mut pkt = Self {
+            hdr: VsockPacket::guest_to_host_address(
+                &mem.memory(),
+                head_descr.addr(),
+                VSOCK_PKT_HDR_SIZE,
+            )
+            .ok_or(Error::GuestMemoryError)? as *mut u8,
+            buf: None,
+            buf_size: 0,
+        };
+
+        dbg!("Checking whether packet is empty");
+
+        // Zero length packet
+        if pkt.is_empty() {
+            return Ok(pkt);
+        }
+
+        dbg!("PLEASE DON'T SHOW UP!!");
+
+        // TODO: Maximum packet size
+
+        // There exists packet data as well
+        let data_descr = descr_vec[1];
+
+        // Data buffer should be as large as described in the header
+        if data_descr.len() < pkt.len() {
+            return Err(Error::DataDescTooSmall);
+        }
+
+        pkt.buf_size = data_descr.len() as usize;
+        pkt.buf = Some(
+            VsockPacket::guest_to_host_address(
+                &mem.memory(),
+                data_descr.addr(),
+                data_descr.len() as usize,
+            )
+            .ok_or(Error::GuestMemoryError)? as *mut u8,
+        );
+
+        Ok(pkt)
+    }
+
     /// Convert an absolute address in guest address space to a host
     /// pointer and verify that the provided size defines a valid
     /// range withing a single memory region
@@ -415,6 +512,41 @@ impl VsockPacket {
         LittleEndian::write_u16(&mut self.hdr_mut()[HDROFF_OP..], op);
         self
     }
+
+    /// Check if the packet has no data
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get destination port from packet
+    fn dst_port(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_DST_PORT..])
+    }
+
+    /// Get source port from packet
+    fn src_port(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_SRC_PORT..])
+    }
+
+    /// Get source cid from packet
+    fn src_cid(&self) -> u64 {
+        LittleEndian::read_u64(&self.hdr()[HDROFF_SRC_CID..])
+    }
+
+    /// Get destination cid from packet
+    fn dst_cid(&self) -> u64 {
+        LittleEndian::read_u64(&self.hdr()[HDROFF_DST_CID..])
+    }
+
+    /// Get packet type
+    fn pkt_type(&self) -> u16 {
+        LittleEndian::read_u16(&self.hdr()[HDROFF_TYPE..])
+    }
+
+    /// Get operation requested in the packet
+    fn op(&self) -> u16 {
+        LittleEndian::read_u16(&self.hdr()[HDROFF_OP..])
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Debug)]
@@ -472,6 +604,55 @@ impl VsockThreadBackend {
         let conn = self.conn_map.get_mut(&key).unwrap();
 
         conn.recv_pkt(pkt)?;
+
+        Ok(())
+    }
+
+    /// Deliver a guest generated packet to its destination in the backend
+    ///
+    /// Absorbs unexpected packets, handles rest to respective connection
+    /// object.
+    ///
+    /// Returns:
+    /// - always `Ok(())` if packet has been consumed correctly
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+        dbg!("backend: send_pkt");
+        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+
+        // TODO: Rst if packet has unsupported type
+        if pkt.pkt_type() != VSOCK_TYPE_STREAM {
+            info!("vsock: dropping packet of unknown type");
+            return Ok(());
+        }
+
+        // TODO: Handle packets to other CIDs as well
+        if pkt.dst_cid() != VSOCK_HOST_CID {
+            info!(
+                "vsock: dropping packet for cid other than host: {:?}",
+                pkt.hdr()
+            );
+
+            return Ok(());
+        }
+
+        // TODO: Handle cases where connection does not exist
+        if !self.conn_map.contains_key(&key) {
+            // The packet contains a new connection request
+            if pkt.op() == VSOCK_OP_REQUEST {
+                // TODO: handle guest to host connection
+            } else {
+                // TODO: send back RST
+            }
+        }
+
+        if pkt.op() == VSOCK_OP_RST {
+            // TODO: remove connection to handle RST
+            return Ok(());
+        }
+
+        // Forward this packet to its listening connection
+        let conn = self.conn_map.get_mut(&key).unwrap();
+        conn.send_pkt(pkt)?;
 
         Ok(())
     }
@@ -663,6 +844,7 @@ impl VhostUserVsockThread {
                 let connected = vsock_conn.connect;
                 if connected.clone() {
                     // TODO: If connected add a request to the queue
+                    dbg!("New connection connected!!");
                 } else {
                 }
             }
@@ -819,7 +1001,101 @@ impl VhostUserVsockThread {
         Ok(false)
     }
 
+    fn process_tx_queue(
+        &mut self,
+        queue: &mut Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+        vring_lock: Arc<RwLock<Vring>>,
+    ) -> Result<bool> {
+        dbg!("process_tx_queue");
+        let mut used_any = false;
+
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
+            dbg!("process_tx_queue: Iterating queue");
+            used_any = true;
+            let atomic_mem = atomic_mem.clone();
+
+            let head_idx = avail_desc.head_index();
+            let pkt = match VsockPacket::from_tx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    dbg!("vsock: error reading TX packet: {:?}", e);
+                    continue;
+                }
+            };
+
+            dbg!("process_tx_queue: sending packet to backend");
+            if self.thread_backend.send_pkt(&pkt).is_err() {
+                queue.go_to_previous_position();
+                break;
+            }
+
+            // TODO: Check if the protocol requires read length to be correct
+            let used_len = 0;
+
+            let vring_lock = vring_lock.clone();
+            let event_idx = self.event_idx;
+
+            self.pool.spawn_ok(async move {
+                let mut vring = vring_lock.write().unwrap();
+                if event_idx {
+                    let queue = vring.mut_queue();
+                    if queue.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match queue.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring
+                        .mut_queue()
+                        .add_used(head_idx, used_len as u32)
+                        .is_err()
+                    {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
+                }
+            });
+        }
+
+        Ok(used_any)
+    }
+
     fn process_tx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
+        dbg!("Process tx");
+        let mut vring = vring_lock.write().unwrap();
+        let queue = vring.mut_queue();
+
+        if event_idx {
+            dbg!("process_tx: Yes event_idx");
+            // To properly handle EVENT_IDX we need to keep calling
+            // process_rx_queue until it stops finding new requests
+            // on the queue, as vm-virtio's Queue implementation
+            // only checks avail_index once
+            loop {
+                queue.disable_notification().unwrap();
+                self.process_tx_queue(queue, vring_lock.clone())?;
+                if !queue.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            dbg!("process_tx: No event idx");
+            self.process_tx_queue(queue, vring_lock.clone())?;
+        }
         Ok(false)
     }
 }
@@ -882,6 +1158,21 @@ impl VsockConnection {
         }
 
         Err(Error::NoData)
+    }
+
+    /// Deliver a guest generated packet to this connection
+    ///
+    /// Returns:
+    /// - always `Ok(())` to indicate that the packet has been consumed
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+        dbg!("VsockConnection: send_pkt");
+        if pkt.op() == VSOCK_OP_RESPONSE {
+            // Confirmation for a host initiated connection
+            dbg!("VsockConnection: VSOCK_OP_RESPONSE");
+            self.connect = true;
+        }
+
+        Ok(())
     }
 
     fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
@@ -986,7 +1277,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
                 dbg!("TX_QUEUE_EVENT");
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
-                    thread.process_rx(vring_tx_lock.clone(), evt_idx)?;
+                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             EVT_QUEUE_EVENT => {
