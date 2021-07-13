@@ -800,10 +800,10 @@ impl VhostUserVsockThread {
                     warn!("Unable to accept new local connection: {:?}", err);
                 });
         } else {
-            // Check if the stream represented by fd has already establishes a
+            // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
-            dbg!("Accepting new local connection");
             if !self.thread_backend.listener_map.contains_key(&fd) {
+                dbg!("Accepting new local connection");
                 let mut unix_stream = self.thread_backend.stream_map.remove(&fd).unwrap();
                 // new connection
                 // Local peer is sending a "connect PORT\n" command
@@ -834,17 +834,20 @@ impl VhostUserVsockThread {
                     "new element added to backend_rxq: {:?}",
                     &self.thread_backend.backend_rxq
                 );
-
-                // Unregister stream from the epoll, register when connection is
-                // established with the guest
-                // Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
             } else {
+                dbg!("Previously connected connection");
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
                 let vsock_conn = self.thread_backend.conn_map.get(&key).unwrap();
+
+                // TODO: This probably always evaluates to true in this block
                 let connected = vsock_conn.connect;
                 if connected.clone() {
                     // TODO: If connected add a request to the queue
                     dbg!("New connection connected!!");
+
+                    // Unregister stream from the epoll, register when connection is
+                    // established with the guest
+                    Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
                 } else {
                 }
             }
