@@ -125,6 +125,8 @@ const VSOCK_OP_REQUEST: u16 = 1;
 const VSOCK_OP_RESPONSE: u16 = 2;
 // Connection reset
 const VSOCK_OP_RST: u16 = 3;
+// Data read/write
+const VSOCK_OP_RW: u16 = 5;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -176,6 +178,8 @@ enum Error {
     UnreadableDescriptor,
     /// Data buffer size less than size in packet header
     DataDescTooSmall,
+    /// Packet missing data buffer
+    PktBufMissing,
 }
 
 impl fmt::Display for Error {
@@ -552,6 +556,19 @@ impl VsockPacket {
     fn op(&self) -> u16 {
         LittleEndian::read_u16(&self.hdr()[HDROFF_OP..])
     }
+
+    /// Byte slice mutable access to vsock packet data buffer
+    fn buf_mut(&mut self) -> Option<&mut [u8]> {
+        // Safe as bound checks performed while creating packet
+        self.buf
+            .map(|ptr| unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) })
+    }
+
+    /// Set data buffer length
+    fn set_len(&mut self, len: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_LEN..], len);
+        self
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
@@ -706,14 +723,14 @@ impl VhostUserVsockThread {
             local_port: 0,
         };
 
-        thread.epoll_register(host_raw_fd)?;
+        VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd)?;
 
         Ok(thread)
     }
 
-    fn epoll_register(&self, fd: RawFd) -> Result<()> {
+    fn epoll_register(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
         epoll::ctl(
-            self.epoll_file.as_raw_fd(),
+            epoll_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd,
             epoll::Event::new(epoll::Events::EPOLLIN, fd as u64),
@@ -822,8 +839,13 @@ impl VhostUserVsockThread {
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
-                let mut new_vsock_conn =
-                    VsockConnection::new(unix_stream, VSOCK_HOST_CID, local_port, self.guest_cid);
+                let mut new_vsock_conn = VsockConnection::new(
+                    unix_stream,
+                    VSOCK_HOST_CID,
+                    local_port,
+                    self.guest_cid,
+                    self.get_epoll_fd(),
+                );
                 new_vsock_conn.rx_queue.enqueue(RxOps::Request);
                 new_vsock_conn.set_peer_port(peer_port);
 
@@ -910,7 +932,7 @@ impl VhostUserVsockThread {
         let stream_fd = stream.as_raw_fd();
         self.thread_backend.stream_map.insert(stream_fd, stream);
         dbg!("stream_fd: {}", stream_fd);
-        self.epoll_register(stream_fd)?;
+        VhostUserVsockThread::epoll_register(self.get_epoll_fd(), stream_fd)?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
         dbg!();
@@ -1134,10 +1156,26 @@ struct VsockConnection {
     guest_cid: u64,
     /// Total number of bytes written to stream from tx buffer
     fwd_cnt: Wrapping<u32>,
+    last_fwd_cnt: Wrapping<u32>,
+    /// Size of buffer the guest has allocated for this connection
+    peer_buf_alloc: u32,
+    /// Number of bytes the peer has forwarded to a connection
+    peer_fwd_cnt: Wrapping<u32>,
+    /// The total number of bytes sent to the guest vsock driver
+    rx_cnt: Wrapping<u32>,
+    /// epoll fd to which this connection's stream has to be added
+    epoll_fd: RawFd,
 }
 
 impl VsockConnection {
-    fn new(stream: UnixStream, local_cid: u64, local_port: u32, guest_cid: u64) -> Self {
+    fn new(
+        stream: UnixStream,
+        local_cid: u64,
+        local_port: u32,
+        guest_cid: u64,
+        epoll_fd: RawFd,
+    ) -> Self {
+        // TODO: Create a separate new for guest initiated connections
         Self {
             stream: stream,
             connect: false,
@@ -1147,6 +1185,11 @@ impl VsockConnection {
             local_port,
             guest_cid,
             fwd_cnt: Wrapping(0),
+            last_fwd_cnt: Wrapping(0),
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            epoll_fd,
         }
     }
 
@@ -1177,6 +1220,36 @@ impl VsockConnection {
             }
             Some(RxOps::Rw) => {
                 dbg!("RxOps::Rw");
+
+                if !self.connect {
+                    // TODO: Send RST as data packet is only valid for
+                    // connected connections
+                }
+
+                // Check if peer has space for data
+                if self.need_credit_update_from_peer() {
+                    // TODO: Fix this, TX_EVENT not got after sending this packet
+                }
+                let buf = pkt.buf_mut().ok_or(Error::PktBufMissing)?;
+                match self.stream.read(&mut buf[..]) {
+                    Ok(read_cnt) => {
+                        if read_cnt == 0 {
+                            // TODO: Handle the stream closed case
+                        } else {
+                            pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
+                            // Re-register the stream file descriptor
+                            VhostUserVsockThread::epoll_register(
+                                self.epoll_fd,
+                                self.stream.as_raw_fd(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    Err(err) => {
+                        dbg!("Error reading from stream: {:?}", err);
+                    }
+                }
+                return Ok(());
             }
             _ => {
                 return Err(Error::NoRequestRx);
@@ -1214,6 +1287,18 @@ impl VsockConnection {
             .set_type(VSOCK_TYPE_STREAM)
             .set_buf_alloc(CONN_TX_BUF_SIZE)
             .set_fwd_cnt(self.fwd_cnt.0)
+    }
+
+    /// Get max number of bytes we can send to peer without overflowing
+    /// the peer's buffer.
+    fn peer_avail_credit(&self) -> usize {
+        (Wrapping(self.peer_buf_alloc as u32) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+    }
+
+    /// Check if we need a credit update from the peer before sending
+    /// more data to it.
+    fn need_credit_update_from_peer(&self) -> bool {
+        self.peer_avail_credit() == 0
     }
 }
 
