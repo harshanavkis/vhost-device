@@ -910,6 +910,7 @@ impl VhostUserVsockThread {
                     VSOCK_HOST_CID,
                     local_port,
                     self.guest_cid,
+                    peer_port,
                     self.get_epoll_fd(),
                 );
                 new_vsock_conn.rx_queue.enqueue(RxOps::Request);
@@ -1241,13 +1242,14 @@ impl VsockConnection {
         local_cid: u64,
         local_port: u32,
         guest_cid: u64,
+        guest_port: u32,
         epoll_fd: RawFd,
     ) -> Self {
         // TODO: Create a separate new for guest initiated connections
         Self {
             stream: stream,
             connect: false,
-            peer_port: 0,
+            peer_port: guest_port,
             rx_queue: RxQueue::new(),
             local_cid,
             local_port,
