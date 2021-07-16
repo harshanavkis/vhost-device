@@ -180,6 +180,10 @@ enum Error {
     DataDescTooSmall,
     /// Packet missing data buffer
     PktBufMissing,
+    /// Failed to connect to unix socket
+    UnixConnect(std::io::Error),
+    /// Unable to add new connection
+    AddNewConnection,
 }
 
 impl fmt::Display for Error {
@@ -240,6 +244,8 @@ enum RxOps {
     Request = 0,
     /// VSOCK_OP_RW
     Rw = 1,
+    /// VSOCK_OP_RESPONSE
+    Response = 2,
 }
 
 impl RxOps {
@@ -280,7 +286,10 @@ impl RxQueue {
             return Some(RxOps::Request);
         }
         if self.contains(RxOps::Rw.bitmask()) {
-            Some(RxOps::Rw)
+            return Some(RxOps::Rw);
+        }
+        if self.contains(RxOps::Response.bitmask()) {
+            Some(RxOps::Response)
         } else {
             None
         }
@@ -586,15 +595,18 @@ impl ConnMapKey {
     }
 }
 
+// TODO: convert UnixStream to Arc<Mutex<UnixStream>>
 struct VsockThreadBackend {
     listener_map: HashMap<RawFd, ConnMapKey>,
     conn_map: HashMap<ConnMapKey, VsockConnection>,
     backend_rxq: VecDeque<ConnMapKey>,
     stream_map: HashMap<i32, UnixStream>,
+    host_socket_path: String,
+    epoll_fd: i32,
 }
 
 impl VsockThreadBackend {
-    fn new() -> Self {
+    fn new(host_socket_path: String, epoll_fd: i32) -> Self {
         Self {
             listener_map: HashMap::new(),
             conn_map: HashMap::new(),
@@ -602,6 +614,8 @@ impl VsockThreadBackend {
             // Need this map to prevent connected stream from closing
             // Need to thimk of a better solution
             stream_map: HashMap::new(),
+            host_socket_path,
+            epoll_fd,
         }
     }
 
@@ -626,6 +640,7 @@ impl VsockThreadBackend {
         let conn = self.conn_map.get_mut(&key).unwrap();
 
         conn.recv_pkt(pkt)?;
+        dbg!("PKT OP: {}", pkt.op());
 
         Ok(())
     }
@@ -657,18 +672,21 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
+        dbg!("PKT OP: {}", pkt.op());
         // TODO: Handle cases where connection does not exist
         if !self.conn_map.contains_key(&key) {
             // The packet contains a new connection request
             if pkt.op() == VSOCK_OP_REQUEST {
-                // TODO: handle guest to host connection
+                self.handle_new_guest_conn(&pkt);
             } else {
                 // TODO: send back RST
             }
+            return Ok(());
         }
 
         if pkt.op() == VSOCK_OP_RST {
             // TODO: remove connection to handle RST
+            dbg!("send_pkt: Received RST");
             return Ok(());
         }
 
@@ -677,6 +695,54 @@ impl VsockThreadBackend {
         conn.send_pkt(pkt)?;
 
         Ok(())
+    }
+
+    /// Handle a new guest initiated connection, i.e from the peer, the guest driver
+    ///
+    /// Attempts to connect to a host side unix socket listening on a path
+    /// corresponding to the destination port as follows:
+    /// - "{self.host_sock_path}_{local_port}""
+    fn handle_new_guest_conn(&mut self, pkt: &VsockPacket) {
+        let port_path = format!("{}_{}", self.host_socket_path, pkt.dst_port());
+
+        UnixStream::connect(port_path)
+            .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
+            .map_err(Error::UnixConnect)
+            .and_then(|stream| self.add_new_guest_conn(stream, pkt))
+            .unwrap_or_else(|_| self.enq_rst());
+    }
+
+    /// Wrapper to add new connection to relevant HashMaps
+    fn add_new_guest_conn(&mut self, stream: UnixStream, pkt: &VsockPacket) -> Result<()> {
+        let stream_fd = stream.as_raw_fd();
+        self.listener_map
+            .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
+
+        let vsock_conn = VsockConnection::new_peer_init(
+            stream,
+            pkt.dst_cid(),
+            pkt.dst_port(),
+            pkt.src_cid(),
+            pkt.src_port(),
+            self.epoll_fd,
+        );
+
+        // vsock_conn.connect = true;
+        self.conn_map
+            .insert(ConnMapKey::new(pkt.dst_port(), pkt.src_port()), vsock_conn);
+        self.backend_rxq
+            .push_back(ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
+        self.stream_map
+            .insert(stream_fd, unsafe { UnixStream::from_raw_fd(stream_fd) });
+
+        VhostUserVsockThread::epoll_register(self.epoll_fd, stream_fd)?;
+        Ok(())
+    }
+
+    /// Enqueue RST packets to be sent to guest
+    fn enq_rst(&mut self) {
+        // TODO
+        dbg!("New guest conn error: Enqueue RST");
     }
 }
 
@@ -714,7 +780,7 @@ impl VhostUserVsockThread {
             kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             vring_worker: None,
             epoll_file: epoll_file,
-            thread_backend: VsockThreadBackend::new(),
+            thread_backend: VsockThreadBackend::new(uds_path, epoll_fd),
             guest_cid,
             pool: ThreadPoolBuilder::new()
                 .pool_size(1)
@@ -839,7 +905,7 @@ impl VhostUserVsockThread {
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
-                let mut new_vsock_conn = VsockConnection::new(
+                let mut new_vsock_conn = VsockConnection::new_local_init(
                     unix_stream,
                     VSOCK_HOST_CID,
                     local_port,
@@ -951,7 +1017,7 @@ impl VhostUserVsockThread {
         };
 
         // TODO: Understand if next_avail is incremented properly
-        dbg!("Rx Queue: {:?}", queue.clone());
+        // dbg!("Rx Queue: {:?}", queue.clone());
 
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
             if !self.thread_backend.pending_rx() {
@@ -1170,7 +1236,7 @@ struct VsockConnection {
 }
 
 impl VsockConnection {
-    fn new(
+    fn new_local_init(
         stream: UnixStream,
         local_cid: u64,
         local_port: u32,
@@ -1183,6 +1249,34 @@ impl VsockConnection {
             connect: false,
             peer_port: 0,
             rx_queue: RxQueue::new(),
+            local_cid,
+            local_port,
+            guest_cid,
+            fwd_cnt: Wrapping(0),
+            last_fwd_cnt: Wrapping(0),
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            epoll_fd,
+        }
+    }
+
+    fn new_peer_init(
+        stream: UnixStream,
+        local_cid: u64,
+        local_port: u32,
+        guest_cid: u64,
+        guest_port: u32,
+        epoll_fd: RawFd,
+    ) -> Self {
+        // TODO: Create a separate new for guest initiated connections
+        let mut rx_queue = RxQueue::new();
+        rx_queue.enqueue(RxOps::Response);
+        Self {
+            stream: stream,
+            connect: false,
+            peer_port: guest_port,
+            rx_queue: rx_queue,
             local_cid,
             local_port,
             guest_cid,
@@ -1253,6 +1347,14 @@ impl VsockConnection {
                 }
                 return Ok(());
             }
+            Some(RxOps::Response) => {
+                dbg!("RxOps::Response");
+                dbg!("GCID: {}", pkt.dst_cid());
+                dbg!("GPORT: {}", pkt.dst_port());
+                self.connect = true;
+                pkt.set_op(VSOCK_OP_RESPONSE);
+                return Ok(());
+            }
             _ => {
                 return Err(Error::NoRequestRx);
             }
@@ -1270,6 +1372,7 @@ impl VsockConnection {
         if pkt.op() == VSOCK_OP_RESPONSE {
             // Confirmation for a host initiated connection
             dbg!("VsockConnection: VSOCK_OP_RESPONSE");
+            // TODO: Print `OK [GUEST-PORT]` to host side listener
             self.connect = true;
         }
 
