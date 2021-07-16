@@ -20,6 +20,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::mem;
 use std::num::Wrapping;
 use std::os::unix::net::UnixListener;
@@ -184,6 +185,8 @@ enum Error {
     UnixConnect(std::io::Error),
     /// Unable to add new connection
     AddNewConnection,
+    /// Unable to write to unix stream
+    UnixWrite,
 }
 
 impl fmt::Display for Error {
@@ -571,6 +574,13 @@ impl VsockPacket {
         // Safe as bound checks performed while creating packet
         self.buf
             .map(|ptr| unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) })
+    }
+
+    /// Byte slice access to vsock packet data buffer
+    fn buf(&self) -> Option<&[u8]> {
+        // Safe as bound checks performed while creating packet
+        self.buf
+            .map(|ptr| unsafe { std::slice::from_raw_parts(ptr as *const u8, self.buf_size) })
     }
 
     /// Set data buffer length
@@ -1376,6 +1386,23 @@ impl VsockConnection {
             dbg!("VsockConnection: VSOCK_OP_RESPONSE");
             // TODO: Print `OK [GUEST-PORT]` to host side listener
             self.connect = true;
+        } else if pkt.op() == VSOCK_OP_RW {
+            if pkt.buf().is_none() {
+                info!(
+                    "Dropping empty packet from guest (lp={}, pp={})",
+                    self.local_port, self.peer_port
+                );
+                return Ok(());
+            }
+
+            let buf_slice = &pkt.buf().unwrap()[..(pkt.len() as usize)];
+            let written_count = match self.stream.write(buf_slice) {
+                Ok(cnt) => cnt,
+                Err(e) => {
+                    return Err(Error::UnixWrite);
+                }
+            };
+            dbg!("Written count: {}", written_count);
         }
 
         Ok(())
