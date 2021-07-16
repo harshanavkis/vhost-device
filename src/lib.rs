@@ -32,7 +32,6 @@ use std::process;
 use std::result;
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::u16;
 use std::u32;
 use std::u64;
@@ -48,7 +47,6 @@ use virtio_bindings::bindings::virtio_blk::__u64;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_NOTIFY_ON_EMPTY;
 use virtio_bindings::bindings::virtio_net::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::Descriptor;
 use virtio_queue::DescriptorChain;
 use virtio_queue::Queue;
 use vm_memory::GuestAddress;
@@ -115,9 +113,6 @@ const VSOCK_TYPE_STREAM: u16 = 1;
 // Vsock connection TX buffer capacity
 const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
-// Thread pool size
-const THREAD_POOL_SIZE: usize = 1;
-
 // Vsock packet operation ID
 //
 // Connection request
@@ -167,12 +162,8 @@ enum Error {
     HdrDescTooSmall(u32),
     /// Chained guest memory error
     GuestMemoryError,
-    /// No available data
-    NoData,
     /// No rx request available
     NoRequestRx,
-    /// Invalid rx queue request
-    InvalidRxRequest,
     /// Unable to create thread pool
     CreateThreadPool(std::io::Error),
     /// Unable to read from descriptor
@@ -183,8 +174,6 @@ enum Error {
     PktBufMissing,
     /// Failed to connect to unix socket
     UnixConnect(std::io::Error),
-    /// Unable to add new connection
-    AddNewConnection,
     /// Unable to write to unix stream
     UnixWrite,
 }
@@ -300,10 +289,6 @@ impl RxQueue {
 
     fn contains(&self, op: u8) -> bool {
         (self.queue & op) != 0
-    }
-
-    fn pending_rx(&self) -> bool {
-        self.queue != 0
     }
 }
 
@@ -845,16 +830,7 @@ impl VhostUserVsockThread {
             .unwrap();
     }
 
-    fn register_listener(&mut self, fd: RawFd, ev_type: u16) {
-        dbg!("");
-        self.vring_worker
-            .as_ref()
-            .unwrap()
-            .register_listener(fd, epoll::Events::EPOLLIN, u64::from(ev_type))
-            .unwrap();
-    }
-
-    fn process_backend_evt(&mut self, evset: Events) {
+    fn process_backend_evt(&mut self, _evset: Events) {
         // dbg!("Processing backend event");
 
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
@@ -1371,8 +1347,6 @@ impl VsockConnection {
                 return Err(Error::NoRequestRx);
             }
         }
-
-        Err(Error::NoData)
     }
 
     /// Deliver a guest generated packet to this connection
@@ -1398,7 +1372,7 @@ impl VsockConnection {
             let buf_slice = &pkt.buf().unwrap()[..(pkt.len() as usize)];
             let written_count = match self.stream.write(buf_slice) {
                 Ok(cnt) => cnt,
-                Err(e) => {
+                Err(_) => {
                     return Err(Error::UnixWrite);
                 }
             };
