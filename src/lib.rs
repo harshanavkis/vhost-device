@@ -573,6 +573,11 @@ impl VsockPacket {
         LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_LEN..], len);
         self
     }
+
+    /// Read buf alloc
+    fn buf_alloc(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_BUF_ALLOC..])
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
@@ -720,6 +725,7 @@ impl VsockThreadBackend {
             pkt.src_cid(),
             pkt.src_port(),
             self.epoll_fd,
+            pkt.buf_alloc(),
         );
 
         // vsock_conn.connect = true;
@@ -1256,6 +1262,7 @@ impl VsockConnection {
         guest_cid: u64,
         guest_port: u32,
         epoll_fd: RawFd,
+        peer_buf_alloc: u32,
     ) -> Self {
         // TODO: Create a separate new for guest initiated connections
         let mut rx_queue = RxQueue::new();
@@ -1270,7 +1277,7 @@ impl VsockConnection {
             guest_cid,
             fwd_cnt: Wrapping(0),
             last_fwd_cnt: Wrapping(0),
-            peer_buf_alloc: 0,
+            peer_buf_alloc: peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             epoll_fd,
