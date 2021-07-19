@@ -123,6 +123,10 @@ const VSOCK_OP_RESPONSE: u16 = 2;
 const VSOCK_OP_RST: u16 = 3;
 // Data read/write
 const VSOCK_OP_RW: u16 = 5;
+// Flow control credit update
+const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
+// Flow control credit request
+const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -577,6 +581,11 @@ impl VsockPacket {
     /// Read buf alloc
     fn buf_alloc(&self) -> u32 {
         LittleEndian::read_u32(&self.hdr()[HDROFF_BUF_ALLOC..])
+    }
+
+    /// Get fwd cnt from packet header
+    fn fwd_cnt(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_FWD_CNT..])
     }
 }
 
@@ -1320,6 +1329,10 @@ impl VsockConnection {
                 // Check if peer has space for data
                 if self.need_credit_update_from_peer() {
                     // TODO: Fix this, TX_EVENT not got after sending this packet
+                    dbg!("conn.recv_pkt: VSOCK_OP_CREDIT_REQUEST");
+                    self.last_fwd_cnt = self.fwd_cnt;
+                    pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
+                    return Ok(());
                 }
                 let buf = pkt.buf_mut().ok_or(Error::PktBufMissing)?;
                 match self.stream.read(&mut buf[..]) {
@@ -1361,6 +1374,10 @@ impl VsockConnection {
     /// Returns:
     /// - always `Ok(())` to indicate that the packet has been consumed
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+        // Update peer credit information
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+
         dbg!("VsockConnection: send_pkt");
         if pkt.op() == VSOCK_OP_RESPONSE {
             // Confirmation for a host initiated connection
