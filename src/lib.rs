@@ -242,6 +242,8 @@ enum RxOps {
     Rw = 1,
     /// VSOCK_OP_RESPONSE
     Response = 2,
+    /// VSOCK_OP_CREDIT_UPDATE
+    CreditUpdate = 3,
 }
 
 impl RxOps {
@@ -285,7 +287,10 @@ impl RxQueue {
             return Some(RxOps::Rw);
         }
         if self.contains(RxOps::Response.bitmask()) {
-            Some(RxOps::Response)
+            return Some(RxOps::Response);
+        }
+        if self.contains(RxOps::CreditUpdate.bitmask()) {
+            Some(RxOps::CreditUpdate)
         } else {
             None
         }
@@ -293,6 +298,10 @@ impl RxQueue {
 
     fn contains(&self, op: u8) -> bool {
         (self.queue & op) != 0
+    }
+
+    fn pending_rx(&self) -> bool {
+        self.queue != 0
     }
 }
 
@@ -1363,6 +1372,16 @@ impl VsockConnection {
                 pkt.set_op(VSOCK_OP_RESPONSE);
                 return Ok(());
             }
+            Some(RxOps::CreditUpdate) => {
+                dbg!("Explitcit credit update");
+                dbg!("RxOps::CreditUpdate");
+                if !self.rx_queue.pending_rx() {
+                    // Waste an rx buffer if no rx is pending
+                    pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
+                    self.last_fwd_cnt = self.fwd_cnt;
+                }
+                return Ok(());
+            }
             _ => {
                 return Err(Error::NoRequestRx);
             }
@@ -1375,6 +1394,7 @@ impl VsockConnection {
     /// - always `Ok(())` to indicate that the packet has been consumed
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
         // Update peer credit information
+        dbg!("Update credit information from peer");
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
@@ -1401,6 +1421,11 @@ impl VsockConnection {
                 }
             };
             dbg!("Written count: {}", written_count);
+        } else if pkt.op() == VSOCK_OP_CREDIT_UPDATE {
+            // Already updated the credit
+        } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
+            dbg!("send_pkt: VSOCK_OP_CREDIT_REQUEST");
+            self.rx_queue.enqueue(RxOps::CreditUpdate);
         }
 
         Ok(())
