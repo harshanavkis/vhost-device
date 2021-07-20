@@ -1344,7 +1344,13 @@ impl VsockConnection {
                     return Ok(());
                 }
                 let buf = pkt.buf_mut().ok_or(Error::PktBufMissing)?;
-                match self.stream.read(&mut buf[..]) {
+
+                // Perform a credit check to find the maximum read size. The read
+                // data must fit inside a packet buffer and be within peer's
+                // available buffer space
+                let max_read_len = std::cmp::min(buf.len(), self.peer_avail_credit());
+
+                match self.stream.read(&mut buf[..max_read_len]) {
                     Ok(read_cnt) => {
                         if read_cnt == 0 {
                             // TODO: Handle the stream closed case
@@ -1357,6 +1363,8 @@ impl VsockConnection {
                             )
                             .unwrap();
                         }
+                        self.rx_cnt += Wrapping(pkt.len());
+                        self.last_fwd_cnt = self.fwd_cnt;
                     }
                     Err(err) => {
                         dbg!("Error reading from stream: {:?}", err);
