@@ -1460,7 +1460,9 @@ impl VsockConnection {
         if pkt.op() == VSOCK_OP_RESPONSE {
             // Confirmation for a host initiated connection
             dbg!("VsockConnection: VSOCK_OP_RESPONSE");
-            // TODO: Print `OK [GUEST-PORT]` to host side listener
+            // TODO: Handle stream write error in a better manner
+            let response = format!("OK {}\n", self.peer_port);
+            self.stream.write(response.as_bytes()).unwrap();
             self.connect = true;
         } else if pkt.op() == VSOCK_OP_RW {
             if pkt.buf().is_none() {
