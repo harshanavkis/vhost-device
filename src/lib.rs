@@ -142,6 +142,8 @@ enum Error {
     EpollFdCreate(std::io::Error),
     /// Failed to add to epoll
     EpollAdd(std::io::Error),
+    /// Failed to modify evset associated with epoll
+    EpollModify(std::io::Error),
     /// Failed to read from unix stream
     UnixRead(std::io::Error),
     /// Failed to convert byte array to string
@@ -180,6 +182,10 @@ enum Error {
     UnixConnect(std::io::Error),
     /// Unable to write to unix stream
     UnixWrite,
+    /// Unable to push data to local tx buffer
+    LocalTxBufFull,
+    /// Unable to flush data from local tx buffer
+    LocalTxBufFlush(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -754,7 +760,7 @@ impl VsockThreadBackend {
         self.stream_map
             .insert(stream_fd, unsafe { UnixStream::from_raw_fd(stream_fd) });
 
-        VhostUserVsockThread::epoll_register(self.epoll_fd, stream_fd)?;
+        VhostUserVsockThread::epoll_register(self.epoll_fd, stream_fd, epoll::Events::EPOLLIN)?;
         Ok(())
     }
 
@@ -808,17 +814,17 @@ impl VhostUserVsockThread {
             local_port: 0,
         };
 
-        VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd)?;
+        VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
 
         Ok(thread)
     }
 
-    fn epoll_register(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
+    fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
         epoll::ctl(
             epoll_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd,
-            epoll::Event::new(epoll::Events::EPOLLIN, fd as u64),
+            epoll::Event::new(evset, fd as u64),
         )
         .map_err(Error::EpollAdd)?;
 
@@ -833,6 +839,18 @@ impl VhostUserVsockThread {
             epoll::Event::new(epoll::Events::empty(), 0),
         )
         .map_err(Error::EpollRemove)?;
+
+        Ok(())
+    }
+
+    fn epoll_modify(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            epoll::Event::new(evset, fd as u64),
+        )
+        .map_err(Error::EpollModify)?;
 
         Ok(())
     }
@@ -879,7 +897,7 @@ impl VhostUserVsockThread {
         }
     }
 
-    fn handle_event(&mut self, fd: RawFd, _evset: epoll::Events) {
+    fn handle_event(&mut self, fd: RawFd, evset: epoll::Events) {
         dbg!("fd: {}", fd);
         if fd == self.host_sock {
             dbg!("fd==host_sock");
@@ -901,6 +919,9 @@ impl VhostUserVsockThread {
             // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
             if !self.thread_backend.listener_map.contains_key(&fd) {
+                if evset != epoll::Events::EPOLLIN {
+                    return;
+                }
                 dbg!("Accepting new local connection");
                 let mut unix_stream = self.thread_backend.stream_map.remove(&fd).unwrap();
                 // new connection
@@ -938,10 +959,30 @@ impl VhostUserVsockThread {
                     "new element added to backend_rxq: {:?}",
                     &self.thread_backend.backend_rxq
                 );
+
+                Self::epoll_modify(
+                    self.get_epoll_fd(),
+                    fd,
+                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                )
+                .unwrap();
             } else {
                 dbg!("Previously connected connection");
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
                 let vsock_conn = self.thread_backend.conn_map.get_mut(&key).unwrap();
+
+                if evset == epoll::Events::EPOLLOUT {
+                    // dbg!("epollout");
+                    match vsock_conn.tx_buf.flush_to(&mut vsock_conn.stream) {
+                        Ok(cnt) => {
+                            vsock_conn.fwd_cnt += Wrapping(cnt as u32);
+                        }
+                        Err(e) => {
+                            dbg!("Error: {:?}", e);
+                        }
+                    }
+                    return;
+                }
 
                 // TODO: This probably always evaluates to true in this block
                 let connected = vsock_conn.connect;
@@ -1009,7 +1050,11 @@ impl VhostUserVsockThread {
         let stream_fd = stream.as_raw_fd();
         self.thread_backend.stream_map.insert(stream_fd, stream);
         dbg!("stream_fd: {}", stream_fd);
-        VhostUserVsockThread::epoll_register(self.get_epoll_fd(), stream_fd)?;
+        VhostUserVsockThread::epoll_register(
+            self.get_epoll_fd(),
+            stream_fd,
+            epoll::Events::EPOLLIN,
+        )?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
         dbg!();
@@ -1244,6 +1289,8 @@ struct VsockConnection {
     rx_cnt: Wrapping<u32>,
     /// epoll fd to which this connection's stream has to be added
     epoll_fd: RawFd,
+    /// Local tx buffer
+    tx_buf: LocalTxBuf,
 }
 
 impl VsockConnection {
@@ -1270,6 +1317,7 @@ impl VsockConnection {
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             epoll_fd,
+            tx_buf: LocalTxBuf::new(),
         }
     }
 
@@ -1299,6 +1347,7 @@ impl VsockConnection {
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             epoll_fd,
+            tx_buf: LocalTxBuf::new(),
         }
     }
 
@@ -1360,6 +1409,7 @@ impl VsockConnection {
                             VhostUserVsockThread::epoll_register(
                                 self.epoll_fd,
                                 self.stream.as_raw_fd(),
+                                epoll::Events::EPOLLIN,
                             )
                             .unwrap();
                         }
@@ -1422,18 +1472,42 @@ impl VsockConnection {
             }
 
             let buf_slice = &pkt.buf().unwrap()[..(pkt.len() as usize)];
-            let written_count = match self.stream.write(buf_slice) {
-                Ok(cnt) => cnt,
-                Err(_) => {
-                    return Err(Error::UnixWrite);
-                }
-            };
-            dbg!("Written count: {}", written_count);
+            if let Err(err) = self.send_bytes(buf_slice) {
+                // TODO: Terminate this connection
+                dbg!("err:{:?}", err);
+                return Ok(());
+            }
         } else if pkt.op() == VSOCK_OP_CREDIT_UPDATE {
             // Already updated the credit
         } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
             dbg!("send_pkt: VSOCK_OP_CREDIT_REQUEST");
             self.rx_queue.enqueue(RxOps::CreditUpdate);
+        }
+
+        Ok(())
+    }
+
+    fn send_bytes(&mut self, buf: &[u8]) -> Result<()> {
+        if !self.tx_buf.is_empty() {
+            // Data is already present in the buffer and the backend
+            // is waiting for a EPOLLOUT event to flush it
+            return self.tx_buf.push(buf);
+        }
+
+        // Write data to the stream
+        let written_count = match self.stream.write(buf) {
+            Ok(cnt) => cnt,
+            Err(_) => {
+                return Err(Error::UnixWrite);
+            }
+        };
+        dbg!("Written count: {}", written_count);
+
+        // Increment forwarded count by number of bytes written to the stream
+        self.fwd_cnt += Wrapping(written_count as u32);
+
+        if written_count != buf.len() {
+            return self.tx_buf.push(&buf[written_count..]);
         }
 
         Ok(())
@@ -1464,6 +1538,94 @@ impl VsockConnection {
     /// more data to it.
     fn need_credit_update_from_peer(&self) -> bool {
         self.peer_avail_credit() == 0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalTxBuf {
+    /// Buffer holding data to be forwarded to a host-side application
+    buf: Vec<u8>,
+    /// Index into buffer from which data can be consumed from the buffer
+    head: Wrapping<u32>,
+    /// Index into buffer from which data can be added to the buffer
+    tail: Wrapping<u32>,
+}
+
+impl LocalTxBuf {
+    /// Create a new instance of LocalTxBuf
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(CONN_TX_BUF_SIZE as usize),
+            head: Wrapping(0),
+            tail: Wrapping(0),
+        }
+    }
+
+    /// Check if the buf is empty
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Add new data to the tx buffer, push all or none
+    /// Returns LocalTxBufFull error if space not sufficient
+    fn push(&mut self, buf: &[u8]) -> Result<()> {
+        if CONN_TX_BUF_SIZE as usize - self.len() < buf.len() {
+            return Err(Error::LocalTxBufFull);
+        }
+
+        let buf_len = buf.len();
+        let start = self.tail.0;
+
+        if self.tail.0 > self.head.0 {
+            // Data to be pushed at the end of the buffer
+            if self.tail.0 as usize + buf_len <= CONN_TX_BUF_SIZE as usize {
+                // Entire buffer fits at the end of the local tx buffer
+                self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
+                self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
+            } else {
+                // Only part of the buffer fits at the end of the local tx buffer
+                self.buf[start as usize..]
+                    .clone_from_slice(&buf[..(CONN_TX_BUF_SIZE - start) as usize]);
+                self.buf[0..].clone_from_slice(&buf[(CONN_TX_BUF_SIZE - start) as usize..]);
+                self.tail.0 = CONN_TX_BUF_SIZE - start;
+            }
+        } else if self.tail.0 < self.head.0 {
+            // Data should fit here as checks are performed above
+            self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
+            self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Flush buf data to stream
+    fn flush_to(&mut self, stream: &mut UnixStream) -> Result<usize> {
+        if self.is_empty() {
+            return Ok(0);
+        }
+
+        dbg!("Flushing non-empty tx buffer");
+
+        if self.tail.0 > self.head.0 {
+            // Data to be flushed lies between head and tail
+            let written = stream
+                .write(&self.buf[self.head.0 as usize..self.tail.0 as usize])
+                .map_err(Error::LocalTxBufFlush)?;
+            self.head += Wrapping(written as u32);
+            return Ok(written);
+        } else {
+            // Data to be flushed lies between head and end of buffer
+            // and between start of buffer to tail
+            let written = stream
+                .write(&self.buf[self.head.0 as usize..])
+                .map_err(Error::LocalTxBufFlush)?;
+            self.head.0 = (self.head + Wrapping(written as u32)).0 % CONN_TX_BUF_SIZE;
+            return Ok(written);
+        }
+    }
+
+    /// Return amount of data in the buffer
+    fn len(&self) -> usize {
+        (self.tail - self.head).0 as usize
     }
 }
 
@@ -1534,6 +1696,10 @@ impl VhostUserBackend for VhostUserVsockBackend {
     ) -> result::Result<bool, io::Error> {
         let vring_rx_lock = vrings[0].clone();
         let vring_tx_lock = vrings[1].clone();
+
+        if evset == epoll::Events::EPOLLOUT {
+            dbg!("received epollout");
+        }
 
         if evset != epoll::Events::EPOLLIN {
             return Err(Error::HandleEventNotEpollIn.into());
