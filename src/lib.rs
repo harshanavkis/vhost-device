@@ -1072,13 +1072,7 @@ impl VhostUserVsockThread {
             None => return Err(Error::NoMemoryConfigured),
         };
 
-        // TODO: Understand if next_avail is incremented properly
-        // dbg!("Rx Queue: {:?}", queue.clone());
-
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
-            if !self.thread_backend.pending_rx() {
-                break;
-            }
             used_any = true;
             let atomic_mem = atomic_mem.clone();
 
@@ -1131,6 +1125,11 @@ impl VhostUserVsockThread {
                     vring.signal_used_queue().unwrap();
                 }
             });
+
+            if !self.thread_backend.pending_rx() {
+                dbg!("No pending rx");
+                break;
+            }
         }
         Ok(used_any)
     }
@@ -1159,9 +1158,9 @@ impl VhostUserVsockThread {
                 }
                 // TODO: This may not be required because of
                 // previous pending_rx check
-                if !work {
-                    break;
-                }
+                // if !work {
+                //     break;
+                // }
             }
         } else {
             dbg!("process_rx: No event_idx");
