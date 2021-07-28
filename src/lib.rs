@@ -1409,9 +1409,9 @@ impl VsockConnection {
                 dbg!("RxOps::Rw");
 
                 if !self.connect {
-                    // TODO: Send RST as data packet is only valid for
-                    // connected connections
                     dbg!("!self.connect");
+                    pkt.set_op(VSOCK_OP_RST);
+                    return Ok(());
                 }
 
                 // Check if peer has space for data
