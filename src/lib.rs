@@ -121,12 +121,21 @@ const VSOCK_OP_REQUEST: u16 = 1;
 const VSOCK_OP_RESPONSE: u16 = 2;
 // Connection reset
 const VSOCK_OP_RST: u16 = 3;
+// Shutdown connection
+const VSOCK_OP_SHUTDOWN: u16 = 4;
 // Data read/write
 const VSOCK_OP_RW: u16 = 5;
 // Flow control credit update
 const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
 // Flow control credit request
 const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
+
+// Vsock packet flags
+//
+// VSOCK_OP_SHUTDOWN: Packet sender will receive no more data
+const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
+// VSOCK_OP_SHUTDOWN: Packet sender will send no more data
+const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -432,7 +441,7 @@ impl VsockPacket {
             return Ok(pkt);
         }
 
-        dbg!("PLEASE DON'T SHOW UP!!");
+        // dbg!("PLEASE DON'T SHOW UP!!");
 
         // TODO: Maximum packet size
 
@@ -601,6 +610,23 @@ impl VsockPacket {
     /// Get fwd cnt from packet header
     fn fwd_cnt(&self) -> u32 {
         LittleEndian::read_u32(&self.hdr()[HDROFF_FWD_CNT..])
+    }
+
+    /// Read flags from the packet header
+    fn flags(&self) -> u32 {
+        LittleEndian::read_u32(&self.hdr()[HDROFF_FLAGS..])
+    }
+
+    /// Set packet header flag to flags
+    fn set_flags(&mut self, flags: u32) -> &mut Self {
+        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_FLAGS..], flags);
+        self
+    }
+
+    /// Set OP specific flags
+    fn set_flag(&mut self, flag: u32) -> &mut Self {
+        self.set_flags(self.flags() | flag);
+        self
     }
 }
 
@@ -898,9 +924,9 @@ impl VhostUserVsockThread {
     }
 
     fn handle_event(&mut self, fd: RawFd, evset: epoll::Events) {
-        dbg!("fd: {}", fd);
+        // dbg!("fd: {}", fd);
         if fd == self.host_sock {
-            dbg!("fd==host_sock");
+            // dbg!("fd==host_sock");
             self.host_listener
                 .accept()
                 .map_err(Error::UnixAccept)
@@ -967,7 +993,7 @@ impl VhostUserVsockThread {
                 )
                 .unwrap();
             } else {
-                dbg!("Previously connected connection");
+                // dbg!("Previously connected connection");
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
                 let vsock_conn = self.thread_backend.conn_map.get_mut(&key).unwrap();
 
@@ -1174,7 +1200,7 @@ impl VhostUserVsockThread {
         queue: &mut Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
         vring_lock: Arc<RwLock<Vring>>,
     ) -> Result<bool> {
-        dbg!("process_tx_queue");
+        // dbg!("process_tx_queue");
         let mut used_any = false;
 
         let atomic_mem = match &self.mem {
@@ -1243,12 +1269,12 @@ impl VhostUserVsockThread {
     }
 
     fn process_tx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
-        dbg!("Process tx");
+        // dbg!("Process tx");
         let mut vring = vring_lock.write().unwrap();
         let queue = vring.mut_queue();
 
         if event_idx {
-            dbg!("process_tx: Yes event_idx");
+            // dbg!("process_tx: Yes event_idx");
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests
             // on the queue, as vm-virtio's Queue implementation
@@ -1261,7 +1287,7 @@ impl VhostUserVsockThread {
                 }
             }
         } else {
-            dbg!("process_tx: No event idx");
+            // dbg!("process_tx: No event idx");
             self.process_tx_queue(queue, vring_lock.clone())?;
         }
         Ok(false)
@@ -1381,6 +1407,7 @@ impl VsockConnection {
                 if !self.connect {
                     // TODO: Send RST as data packet is only valid for
                     // connected connections
+                    dbg!("!self.connect");
                 }
 
                 // Check if peer has space for data
@@ -1402,13 +1429,17 @@ impl VsockConnection {
                     Ok(read_cnt) => {
                         if read_cnt == 0 {
                             // TODO: Handle the stream closed case
+                            dbg!("read_cnt==0");
+                            pkt.set_op(VSOCK_OP_SHUTDOWN)
+                                .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
+                                .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
                         } else {
                             pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
                             // Re-register the stream file descriptor
                             VhostUserVsockThread::epoll_register(
                                 self.epoll_fd,
                                 self.stream.as_raw_fd(),
-                                epoll::Events::EPOLLIN,
+                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                             )
                             .unwrap();
                         }
@@ -1451,11 +1482,11 @@ impl VsockConnection {
     /// - always `Ok(())` to indicate that the packet has been consumed
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
         // Update peer credit information
-        dbg!("Update credit information from peer");
+        // dbg!("Update credit information from peer");
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-        dbg!("VsockConnection: send_pkt");
+        // dbg!("VsockConnection: send_pkt");
         if pkt.op() == VSOCK_OP_RESPONSE {
             // Confirmation for a host initiated connection
             dbg!("VsockConnection: VSOCK_OP_RESPONSE");
@@ -1492,6 +1523,7 @@ impl VsockConnection {
         if !self.tx_buf.is_empty() {
             // Data is already present in the buffer and the backend
             // is waiting for a EPOLLOUT event to flush it
+            dbg!("Tx buf is not empty");
             return self.tx_buf.push(buf);
         }
 
@@ -1507,9 +1539,12 @@ impl VsockConnection {
         // Increment forwarded count by number of bytes written to the stream
         self.fwd_cnt += Wrapping(written_count as u32);
 
+        dbg!("{}", self.fwd_cnt);
+
         if written_count != buf.len() {
             return self.tx_buf.push(&buf[written_count..]);
         }
+        dbg!();
 
         Ok(())
     }
@@ -1571,6 +1606,7 @@ impl LocalTxBuf {
     /// Returns LocalTxBufFull error if space not sufficient
     fn push(&mut self, buf: &[u8]) -> Result<()> {
         if CONN_TX_BUF_SIZE as usize - self.len() < buf.len() {
+            dbg!("Error::LocalTxBufFull");
             return Err(Error::LocalTxBufFull);
         }
 
@@ -1711,27 +1747,27 @@ impl VhostUserBackend for VhostUserVsockBackend {
 
         match device_event {
             RX_QUEUE_EVENT => {
-                dbg!("RX_QUEUE_EVENT");
+                // dbg!("RX_QUEUE_EVENT");
                 if thread.thread_backend.pending_rx() {
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             TX_QUEUE_EVENT => {
-                dbg!("TX_QUEUE_EVENT");
+                // dbg!("TX_QUEUE_EVENT");
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             EVT_QUEUE_EVENT => {
-                dbg!("EVT_QUEUE_EVENT");
+                // dbg!("EVT_QUEUE_EVENT");
             }
             BACKEND_EVENT => {
-                dbg!("BACKEND_EVENT");
+                // dbg!("BACKEND_EVENT");
                 thread.process_backend_evt(evset);
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
-                    dbg!("BACKEND_EVENT: pending_rx");
+                    // dbg!("BACKEND_EVENT: pending_rx");
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
