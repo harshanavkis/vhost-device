@@ -735,8 +735,16 @@ impl VsockThreadBackend {
         }
 
         if pkt.op() == VSOCK_OP_RST {
-            // TODO: remove connection to handle RST
             dbg!("send_pkt: Received RST");
+            let conn = self.conn_map.remove(&key).unwrap();
+            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Could not remove epoll listener for fd {:?}: {:?}",
+                        conn.stream.as_raw_fd(),
+                        err
+                    )
+                });
             return Ok(());
         }
 
