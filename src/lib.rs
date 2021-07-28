@@ -744,6 +744,10 @@ impl VsockThreadBackend {
         let conn = self.conn_map.get_mut(&key).unwrap();
         conn.send_pkt(pkt)?;
 
+        if conn.rx_queue.pending_rx() {
+            self.backend_rxq.push_back(key);
+        }
+
         Ok(())
     }
 
@@ -1538,6 +1542,7 @@ impl VsockConnection {
 
         // Increment forwarded count by number of bytes written to the stream
         self.fwd_cnt += Wrapping(written_count as u32);
+        self.rx_queue.enqueue(RxOps::CreditUpdate);
 
         dbg!("{}", self.fwd_cnt);
 
@@ -1636,6 +1641,7 @@ impl LocalTxBuf {
 
     /// Flush buf data to stream
     fn flush_to(&mut self, stream: &mut UnixStream) -> Result<usize> {
+        // TODO: Check if CREDIT_UPDATE packet needs to be sent after this call
         if self.is_empty() {
             return Ok(0);
         }
