@@ -259,6 +259,8 @@ enum RxOps {
     Response = 2,
     /// VSOCK_OP_CREDIT_UPDATE
     CreditUpdate = 3,
+    /// VSOCK_OP_RST
+    Rst = 4,
 }
 
 impl RxOps {
@@ -305,7 +307,10 @@ impl RxQueue {
             return Some(RxOps::Response);
         }
         if self.contains(RxOps::CreditUpdate.bitmask()) {
-            Some(RxOps::CreditUpdate)
+            return Some(RxOps::CreditUpdate);
+        }
+        if self.contains(RxOps::Rst.bitmask()) {
+            return Some(RxOps::Rst);
         } else {
             None
         }
@@ -689,6 +694,33 @@ impl VsockThreadBackend {
         println!("Length of self.backend_rxq: {}", self.backend_rxq.len());
         let conn = self.conn_map.get_mut(&key).unwrap();
 
+        if conn.rx_queue.peek() == Some(RxOps::Rst) {
+            dbg!("recv_pkt: RxOps::Rst");
+            let conn = self.conn_map.remove(&key).unwrap();
+            self.listener_map.remove(&conn.stream.as_raw_fd());
+            self.stream_map.remove(&conn.stream.as_raw_fd());
+            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Could not remove epoll listener for fd {:?}: {:?}",
+                        conn.stream.as_raw_fd(),
+                        err
+                    )
+                });
+            pkt.set_op(VSOCK_OP_RST)
+                .set_src_cid(VSOCK_HOST_CID)
+                .set_dst_cid(conn.guest_cid)
+                .set_src_port(conn.local_port)
+                .set_dst_port(conn.peer_port)
+                .set_len(0)
+                .set_type(VSOCK_TYPE_STREAM)
+                .set_flags(0)
+                .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+
+            return Ok(());
+        }
+
         conn.recv_pkt(pkt)?;
         dbg!("PKT OP: {}", pkt.op());
 
@@ -738,6 +770,7 @@ impl VsockThreadBackend {
             dbg!("send_pkt: Received RST");
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
+            self.stream_map.remove(&conn.stream.as_raw_fd());
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
@@ -1527,6 +1560,16 @@ impl VsockConnection {
         } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
             dbg!("send_pkt: VSOCK_OP_CREDIT_REQUEST");
             self.rx_queue.enqueue(RxOps::CreditUpdate);
+        } else if pkt.op() == VSOCK_OP_SHUTDOWN {
+            dbg!("send_pkt: VSOCK_OP_SHUTDOWN");
+            let recv_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+            let send_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+
+            if recv_off && send_off {
+                if self.tx_buf.is_empty() {
+                    self.rx_queue.enqueue(RxOps::Rst);
+                }
+            }
         }
 
         Ok(())
