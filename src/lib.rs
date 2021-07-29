@@ -737,6 +737,7 @@ impl VsockThreadBackend {
         if pkt.op() == VSOCK_OP_RST {
             dbg!("send_pkt: Received RST");
             let conn = self.conn_map.remove(&key).unwrap();
+            self.listener_map.remove(&conn.stream.as_raw_fd());
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
