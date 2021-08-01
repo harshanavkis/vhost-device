@@ -1482,12 +1482,13 @@ impl VsockConnection {
                         } else {
                             pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
                             // Re-register the stream file descriptor
-                            VhostUserVsockThread::epoll_register(
+                            match VhostUserVsockThread::epoll_register(
                                 self.epoll_fd,
                                 self.stream.as_raw_fd(),
                                 epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                            )
-                            .unwrap();
+                            ) {
+                                _ => {}
+                            };
                         }
                         self.rx_cnt += Wrapping(pkt.len());
                         self.last_fwd_cnt = self.fwd_cnt;
@@ -1557,6 +1558,25 @@ impl VsockConnection {
             }
         } else if pkt.op() == VSOCK_OP_CREDIT_UPDATE {
             // Already updated the credit
+            dbg!("send_pkt: VSOCK_OP_CREDIT_UPDATE");
+            self.peer_buf_alloc = pkt.buf_alloc();
+            self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+            // Re-register the stream file descriptor
+            match VhostUserVsockThread::epoll_modify(
+                self.epoll_fd,
+                self.stream.as_raw_fd(),
+                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+            ) {
+                Err(_) => {
+                    VhostUserVsockThread::epoll_register(
+                        self.epoll_fd,
+                        self.stream.as_raw_fd(),
+                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            };
         } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
             dbg!("send_pkt: VSOCK_OP_CREDIT_REQUEST");
             self.rx_queue.enqueue(RxOps::CreditUpdate);
