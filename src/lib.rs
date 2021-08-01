@@ -692,7 +692,13 @@ impl VsockThreadBackend {
         println!("{:?}", self.backend_rxq);
         let key = self.backend_rxq.pop_front().unwrap();
         println!("Length of self.backend_rxq: {}", self.backend_rxq.len());
-        let conn = self.conn_map.get_mut(&key).unwrap();
+        let conn = match self.conn_map.get_mut(&key) {
+            Some(conn) => conn,
+            None => {
+                // assume that the connection does not exist
+                return Ok(());
+            }
+        };
 
         if conn.rx_queue.peek() == Some(RxOps::Rst) {
             dbg!("recv_pkt: RxOps::Rst");
@@ -768,6 +774,10 @@ impl VsockThreadBackend {
 
         if pkt.op() == VSOCK_OP_RST {
             dbg!("send_pkt: Received RST");
+            let conn = self.conn_map.get(&key).unwrap();
+            if conn.rx_queue.contains(RxOps::Rst.bitmask()) {
+                return Ok(());
+            }
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
