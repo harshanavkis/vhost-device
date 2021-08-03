@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
@@ -1616,8 +1617,13 @@ impl VsockConnection {
         // Write data to the stream
         let written_count = match self.stream.write(buf) {
             Ok(cnt) => cnt,
-            Err(_) => {
-                return Err(Error::UnixWrite);
+            Err(e) => {
+                if e.kind() == ErrorKind::WouldBlock {
+                    0
+                } else {
+                    println!("send_bytes error: {:?}", e);
+                    return Err(Error::UnixWrite);
+                }
             }
         };
         dbg!("Written count: {}", written_count);
