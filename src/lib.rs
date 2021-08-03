@@ -843,7 +843,11 @@ impl VsockThreadBackend {
         self.stream_map
             .insert(stream_fd, unsafe { UnixStream::from_raw_fd(stream_fd) });
 
-        VhostUserVsockThread::epoll_register(self.epoll_fd, stream_fd, epoll::Events::EPOLLIN)?;
+        VhostUserVsockThread::epoll_register(
+            self.epoll_fd,
+            stream_fd,
+            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+        )?;
         Ok(())
     }
 
@@ -1058,7 +1062,15 @@ impl VhostUserVsockThread {
                     // dbg!("epollout");
                     match vsock_conn.tx_buf.flush_to(&mut vsock_conn.stream) {
                         Ok(cnt) => {
+                            if cnt != 0 {
+                                dbg!("flusht_to cnt: {}", cnt);
+                            }
                             vsock_conn.fwd_cnt += Wrapping(cnt as u32);
+                            vsock_conn.rx_queue.enqueue(RxOps::CreditUpdate);
+                            self.thread_backend.backend_rxq.push_back(ConnMapKey::new(
+                                vsock_conn.local_port,
+                                vsock_conn.peer_port,
+                            ));
                         }
                         Err(e) => {
                             dbg!("Error: {:?}", e);
@@ -1684,7 +1696,7 @@ impl LocalTxBuf {
     /// Create a new instance of LocalTxBuf
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(CONN_TX_BUF_SIZE as usize),
+            buf: vec![0; CONN_TX_BUF_SIZE as usize],
             head: Wrapping(0),
             tail: Wrapping(0),
         }
@@ -1697,33 +1709,47 @@ impl LocalTxBuf {
 
     /// Add new data to the tx buffer, push all or none
     /// Returns LocalTxBufFull error if space not sufficient
-    fn push(&mut self, buf: &[u8]) -> Result<()> {
-        if CONN_TX_BUF_SIZE as usize - self.len() < buf.len() {
+    fn push(&mut self, data_buf: &[u8]) -> Result<()> {
+        if CONN_TX_BUF_SIZE as usize - self.len() < data_buf.len() {
             dbg!("Error::LocalTxBufFull");
             return Err(Error::LocalTxBufFull);
         }
 
-        let buf_len = buf.len();
+        let buf_len = data_buf.len();
         let start = self.tail.0;
 
-        if self.tail.0 > self.head.0 {
-            // Data to be pushed at the end of the buffer
-            if self.tail.0 as usize + buf_len <= CONN_TX_BUF_SIZE as usize {
-                // Entire buffer fits at the end of the local tx buffer
-                self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
-                self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
-            } else {
-                // Only part of the buffer fits at the end of the local tx buffer
-                self.buf[start as usize..]
-                    .clone_from_slice(&buf[..(CONN_TX_BUF_SIZE - start) as usize]);
-                self.buf[0..].clone_from_slice(&buf[(CONN_TX_BUF_SIZE - start) as usize..]);
-                self.tail.0 = CONN_TX_BUF_SIZE - start;
-            }
-        } else if self.tail.0 < self.head.0 {
-            // Data should fit here as checks are performed above
-            self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
-            self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
+        // if self.tail.0 > self.head.0 {
+        //     // Data to be pushed at the end of the buffer
+        //     if self.tail.0 as usize + buf_len <= CONN_TX_BUF_SIZE as usize {
+        //         // Entire buffer fits at the end of the local tx buffer
+        //         self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
+        //         self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
+        //     } else {
+        //         // Only part of the buffer fits at the end of the local tx buffer
+        //         self.buf[start as usize..]
+        //             .clone_from_slice(&buf[..(CONN_TX_BUF_SIZE - start) as usize]);
+        //         self.buf[0..].clone_from_slice(&buf[(CONN_TX_BUF_SIZE - start) as usize..]);
+        //         self.tail.0 = CONN_TX_BUF_SIZE - start;
+        //     }
+        // } else if self.tail.0 < self.head.0 {
+        //     // Data should fit here as checks are performed above
+        //     self.buf[start as usize..(start as usize + buf_len as usize)].clone_from_slice(buf);
+        //     self.tail.0 = (self.tail.0 + buf_len as u32) % CONN_TX_BUF_SIZE;
+        // }
+        let tail_idx = self.tail.0 as usize % CONN_TX_BUF_SIZE as usize;
+
+        // Check if we can fit the data buffer between head and end of buffer
+        let len = std::cmp::min(CONN_TX_BUF_SIZE as usize - tail_idx, data_buf.len());
+        self.buf[tail_idx..tail_idx + len].copy_from_slice(&data_buf[..len]);
+
+        // Check if there is more data to be wrapped around
+        if len < data_buf.len() {
+            self.buf[..(data_buf.len() - len)].copy_from_slice(&data_buf[len..]);
         }
+
+        self.tail += Wrapping(data_buf.len() as u32);
+
+        dbg!("self.tail: {}, self.head: {}", self.tail, self.head);
         Ok(())
     }
 
@@ -1736,22 +1762,36 @@ impl LocalTxBuf {
 
         dbg!("Flushing non-empty tx buffer");
 
-        if self.tail.0 > self.head.0 {
-            // Data to be flushed lies between head and tail
-            let written = stream
-                .write(&self.buf[self.head.0 as usize..self.tail.0 as usize])
-                .map_err(Error::LocalTxBufFlush)?;
-            self.head += Wrapping(written as u32);
-            return Ok(written);
-        } else {
-            // Data to be flushed lies between head and end of buffer
-            // and between start of buffer to tail
-            let written = stream
-                .write(&self.buf[self.head.0 as usize..])
-                .map_err(Error::LocalTxBufFlush)?;
-            self.head.0 = (self.head + Wrapping(written as u32)).0 % CONN_TX_BUF_SIZE;
+        // if self.tail.0 > self.head.0 {
+        //     // Data to be flushed lies between head and tail
+        //     let written = stream
+        //         .write(&self.buf[self.head.0 as usize..self.tail.0 as usize])
+        //         .map_err(Error::LocalTxBufFlush)?;
+        //     self.head += Wrapping(written as u32);
+        //     return Ok(written);
+        // } else {
+        //     // Data to be flushed lies between head and end of buffer
+        //     // and between start of buffer to tail
+        //     let written = stream
+        //         .write(&self.buf[self.head.0 as usize..])
+        //         .map_err(Error::LocalTxBufFlush)?;
+        //     self.head.0 = (self.head + Wrapping(written as u32)).0 % CONN_TX_BUF_SIZE;
+        //     return Ok(written);
+        // }
+        let head_idx = self.head.0 as usize % CONN_TX_BUF_SIZE as usize;
+
+        // First write from head to end of buffer
+        let len = std::cmp::min(CONN_TX_BUF_SIZE as usize - head_idx, self.len());
+        let written = stream
+            .write(&self.buf[head_idx..(head_idx + len)])
+            .map_err(Error::LocalTxBufFlush)?;
+
+        self.head += Wrapping(written as u32);
+        if written < len {
             return Ok(written);
         }
+
+        Ok(written + self.flush_to(stream).unwrap_or(0))
     }
 
     /// Return amount of data in the buffer
