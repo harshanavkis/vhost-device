@@ -287,7 +287,6 @@ impl RxQueue {
     fn dequeue(&mut self) -> Option<RxOps> {
         let op = match self.peek() {
             Some(req) => {
-                dbg!("RxOps not empty");
                 self.queue = self.queue & (!req.clone().bitmask());
                 Some(req)
             }
@@ -399,8 +398,6 @@ impl VsockPacket {
         let mut descr_vec = Vec::with_capacity(2);
         let mut num_descr = 0;
 
-        dbg!("Reading tx_virtqueue_head into packet");
-
         loop {
             if num_descr >= 2 {
                 // TODO: Turn this into an error
@@ -427,8 +424,6 @@ impl VsockPacket {
             return Err(Error::HdrDescTooSmall(head_descr.len()));
         }
 
-        dbg!("Reading tx_virtqueue_head into packet: header len ok");
-
         let mut pkt = Self {
             hdr: VsockPacket::guest_to_host_address(
                 &mem.memory(),
@@ -440,14 +435,10 @@ impl VsockPacket {
             buf_size: 0,
         };
 
-        dbg!("Checking whether packet is empty");
-
         // Zero length packet
         if pkt.is_empty() {
             return Ok(pkt);
         }
-
-        // dbg!("PLEASE DON'T SHOW UP!!");
 
         // TODO: Maximum packet size
 
@@ -689,10 +680,7 @@ impl VsockThreadBackend {
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
         // Pop an event from the backend_rxq
         // TODO: implement recv_pkt for the conn
-        dbg!("Thread backend: recv_pkt");
-        println!("{:?}", self.backend_rxq);
         let key = self.backend_rxq.pop_front().unwrap();
-        println!("Length of self.backend_rxq: {}", self.backend_rxq.len());
         let conn = match self.conn_map.get_mut(&key) {
             Some(conn) => conn,
             None => {
@@ -702,7 +690,6 @@ impl VsockThreadBackend {
         };
 
         if conn.rx_queue.peek() == Some(RxOps::Rst) {
-            dbg!("recv_pkt: RxOps::Rst");
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
@@ -729,7 +716,6 @@ impl VsockThreadBackend {
         }
 
         conn.recv_pkt(pkt)?;
-        dbg!("PKT OP: {}", pkt.op());
 
         Ok(())
     }
@@ -742,7 +728,6 @@ impl VsockThreadBackend {
     /// Returns:
     /// - always `Ok(())` if packet has been consumed correctly
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
-        dbg!("backend: send_pkt");
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
         // TODO: Rst if packet has unsupported type
@@ -761,7 +746,6 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
-        dbg!("PKT OP: {}", pkt.op());
         // TODO: Handle cases where connection does not exist
         if !self.conn_map.contains_key(&key) {
             // The packet contains a new connection request
@@ -774,7 +758,6 @@ impl VsockThreadBackend {
         }
 
         if pkt.op() == VSOCK_OP_RST {
-            dbg!("send_pkt: Received RST");
             let conn = self.conn_map.get(&key).unwrap();
             if conn.rx_queue.contains(RxOps::Rst.bitmask()) {
                 return Ok(());
@@ -960,8 +943,6 @@ impl VhostUserVsockThread {
     }
 
     fn process_backend_evt(&mut self, _evset: Events) {
-        // dbg!("Processing backend event");
-
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
         'epoll: loop {
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
@@ -985,9 +966,7 @@ impl VhostUserVsockThread {
     }
 
     fn handle_event(&mut self, fd: RawFd, evset: epoll::Events) {
-        // dbg!("fd: {}", fd);
         if fd == self.host_sock {
-            // dbg!("fd==host_sock");
             self.host_listener
                 .accept()
                 .map_err(Error::UnixAccept)
@@ -1009,12 +988,10 @@ impl VhostUserVsockThread {
                 if evset != epoll::Events::EPOLLIN {
                     return;
                 }
-                dbg!("Accepting new local connection");
                 let mut unix_stream = self.thread_backend.stream_map.remove(&fd).unwrap();
                 // new connection
                 // Local peer is sending a "connect PORT\n" command
                 let peer_port = Self::read_local_stream_port(&mut unix_stream).unwrap();
-                dbg!("Peer port: {}", peer_port);
 
                 let local_port = self.allocate_local_port();
 
@@ -1042,11 +1019,6 @@ impl VhostUserVsockThread {
                     .backend_rxq
                     .push_back(ConnMapKey::new(local_port, peer_port));
 
-                dbg!(
-                    "new element added to backend_rxq: {:?}",
-                    &self.thread_backend.backend_rxq
-                );
-
                 Self::epoll_modify(
                     self.get_epoll_fd(),
                     fd,
@@ -1054,17 +1026,12 @@ impl VhostUserVsockThread {
                 )
                 .unwrap();
             } else {
-                // dbg!("Previously connected connection");
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
                 let vsock_conn = self.thread_backend.conn_map.get_mut(&key).unwrap();
 
                 if evset == epoll::Events::EPOLLOUT {
-                    // dbg!("epollout");
                     match vsock_conn.tx_buf.flush_to(&mut vsock_conn.stream) {
                         Ok(cnt) => {
-                            if cnt != 0 {
-                                dbg!("flusht_to cnt: {}", cnt);
-                            }
                             vsock_conn.fwd_cnt += Wrapping(cnt as u32);
                             vsock_conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             self.thread_backend.backend_rxq.push_back(ConnMapKey::new(
@@ -1141,10 +1108,8 @@ impl VhostUserVsockThread {
     }
 
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
-        dbg!("Registering new stream with epoll");
         let stream_fd = stream.as_raw_fd();
         self.thread_backend.stream_map.insert(stream_fd, stream);
-        dbg!("stream_fd: {}", stream_fd);
         VhostUserVsockThread::epoll_register(
             self.get_epoll_fd(),
             stream_fd,
@@ -1152,7 +1117,6 @@ impl VhostUserVsockThread {
         )?;
 
         // self.register_listener(stream_fd, BACKEND_EVENT);
-        dbg!();
         Ok(())
     }
 
@@ -1222,7 +1186,6 @@ impl VhostUserVsockThread {
             });
 
             if !self.thread_backend.pending_rx() {
-                dbg!("No pending rx");
                 break;
             }
         }
@@ -1230,18 +1193,15 @@ impl VhostUserVsockThread {
     }
 
     fn process_rx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
-        dbg!("Process rx");
         let mut vring = vring_lock.write().unwrap();
         let queue = vring.mut_queue();
         if event_idx {
-            dbg!("process_rx: Yes event_idx");
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests
             // on the queue, as vm-virtio's Queue implementation
             // only checks avail_index once
             loop {
                 if !self.thread_backend.pending_rx() {
-                    dbg!("process_rx: no pending rx");
                     break;
                 }
                 queue.disable_notification().unwrap();
@@ -1258,7 +1218,6 @@ impl VhostUserVsockThread {
                 // }
             }
         } else {
-            dbg!("process_rx: No event_idx");
             self.process_rx_queue(queue, vring_lock.clone())?;
         }
         Ok(false)
@@ -1269,7 +1228,6 @@ impl VhostUserVsockThread {
         queue: &mut Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
         vring_lock: Arc<RwLock<Vring>>,
     ) -> Result<bool> {
-        // dbg!("process_tx_queue");
         let mut used_any = false;
 
         let atomic_mem = match &self.mem {
@@ -1278,7 +1236,6 @@ impl VhostUserVsockThread {
         };
 
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
-            dbg!("process_tx_queue: Iterating queue");
             used_any = true;
             let atomic_mem = atomic_mem.clone();
 
@@ -1291,7 +1248,6 @@ impl VhostUserVsockThread {
                 }
             };
 
-            dbg!("process_tx_queue: sending packet to backend");
             if self.thread_backend.send_pkt(&pkt).is_err() {
                 queue.go_to_previous_position();
                 break;
@@ -1338,12 +1294,10 @@ impl VhostUserVsockThread {
     }
 
     fn process_tx(&mut self, vring_lock: Arc<RwLock<Vring>>, event_idx: bool) -> Result<bool> {
-        // dbg!("Process tx");
         let mut vring = vring_lock.write().unwrap();
         let queue = vring.mut_queue();
 
         if event_idx {
-            // dbg!("process_tx: Yes event_idx");
             // To properly handle EVENT_IDX we need to keep calling
             // process_rx_queue until it stops finding new requests
             // on the queue, as vm-virtio's Queue implementation
@@ -1356,7 +1310,6 @@ impl VhostUserVsockThread {
                 }
             }
         } else {
-            // dbg!("process_tx: No event idx");
             self.process_tx_queue(queue, vring_lock.clone())?;
         }
         Ok(false)
@@ -1450,10 +1403,8 @@ impl VsockConnection {
     }
 
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
-        dbg!("VsockConnection: recv_pkt");
         self.init_pkt(pkt);
 
-        println!("self.rx_queue: {:?}", self.rx_queue);
         // let rx_op = match self.rx_queue.dequeue() {
         //     Some(op) => op,
         //     None => {
@@ -1462,19 +1413,13 @@ impl VsockConnection {
         //     }
         // };
 
-        // dbg!("rx_op: {:?}", rx_op);
-
         match self.rx_queue.dequeue() {
             Some(RxOps::Request) => {
-                dbg!("RxOps::Request");
                 pkt.set_op(VSOCK_OP_REQUEST);
                 return Ok(());
             }
             Some(RxOps::Rw) => {
-                dbg!("RxOps::Rw");
-
                 if !self.connect {
-                    dbg!("!self.connect");
                     pkt.set_op(VSOCK_OP_RST);
                     return Ok(());
                 }
@@ -1482,7 +1427,6 @@ impl VsockConnection {
                 // Check if peer has space for data
                 if self.need_credit_update_from_peer() {
                     // TODO: Fix this, TX_EVENT not got after sending this packet
-                    dbg!("conn.recv_pkt: VSOCK_OP_CREDIT_REQUEST");
                     self.last_fwd_cnt = self.fwd_cnt;
                     pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
                     return Ok(());
@@ -1498,7 +1442,6 @@ impl VsockConnection {
                     Ok(read_cnt) => {
                         if read_cnt == 0 {
                             // TODO: Handle the stream closed case
-                            dbg!("read_cnt==0");
                             pkt.set_op(VSOCK_OP_SHUTDOWN)
                                 .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
                                 .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
@@ -1516,23 +1459,16 @@ impl VsockConnection {
                         self.rx_cnt += Wrapping(pkt.len());
                         self.last_fwd_cnt = self.fwd_cnt;
                     }
-                    Err(err) => {
-                        dbg!("Error reading from stream: {:?}", err);
-                    }
+                    Err(err) => {}
                 }
                 return Ok(());
             }
             Some(RxOps::Response) => {
-                dbg!("RxOps::Response");
-                dbg!("GCID: {}", pkt.dst_cid());
-                dbg!("GPORT: {}", pkt.dst_port());
                 self.connect = true;
                 pkt.set_op(VSOCK_OP_RESPONSE);
                 return Ok(());
             }
             Some(RxOps::CreditUpdate) => {
-                dbg!("Explitcit credit update");
-                dbg!("RxOps::CreditUpdate");
                 if !self.rx_queue.pending_rx() {
                     // Waste an rx buffer if no rx is pending
                     pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
@@ -1552,14 +1488,11 @@ impl VsockConnection {
     /// - always `Ok(())` to indicate that the packet has been consumed
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
         // Update peer credit information
-        // dbg!("Update credit information from peer");
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-        // dbg!("VsockConnection: send_pkt");
         if pkt.op() == VSOCK_OP_RESPONSE {
             // Confirmation for a host initiated connection
-            dbg!("VsockConnection: VSOCK_OP_RESPONSE");
             // TODO: Handle stream write error in a better manner
             let response = format!("OK {}\n", self.peer_port);
             self.stream.write(response.as_bytes()).unwrap();
@@ -1581,7 +1514,6 @@ impl VsockConnection {
             }
         } else if pkt.op() == VSOCK_OP_CREDIT_UPDATE {
             // Already updated the credit
-            dbg!("send_pkt: VSOCK_OP_CREDIT_UPDATE");
             self.peer_buf_alloc = pkt.buf_alloc();
             self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
             // Re-register the stream file descriptor
@@ -1601,10 +1533,8 @@ impl VsockConnection {
                 _ => {}
             };
         } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
-            dbg!("send_pkt: VSOCK_OP_CREDIT_REQUEST");
             self.rx_queue.enqueue(RxOps::CreditUpdate);
         } else if pkt.op() == VSOCK_OP_SHUTDOWN {
-            dbg!("send_pkt: VSOCK_OP_SHUTDOWN");
             let recv_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_RCV != 0;
             let send_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -1622,7 +1552,6 @@ impl VsockConnection {
         if !self.tx_buf.is_empty() {
             // Data is already present in the buffer and the backend
             // is waiting for a EPOLLOUT event to flush it
-            dbg!("Tx buf is not empty");
             return self.tx_buf.push(buf);
         }
 
@@ -1638,18 +1567,14 @@ impl VsockConnection {
                 }
             }
         };
-        dbg!("Written count: {}", written_count);
 
         // Increment forwarded count by number of bytes written to the stream
         self.fwd_cnt += Wrapping(written_count as u32);
         self.rx_queue.enqueue(RxOps::CreditUpdate);
 
-        dbg!("{}", self.fwd_cnt);
-
         if written_count != buf.len() {
             return self.tx_buf.push(&buf[written_count..]);
         }
-        dbg!();
 
         Ok(())
     }
@@ -1711,7 +1636,6 @@ impl LocalTxBuf {
     /// Returns LocalTxBufFull error if space not sufficient
     fn push(&mut self, data_buf: &[u8]) -> Result<()> {
         if CONN_TX_BUF_SIZE as usize - self.len() < data_buf.len() {
-            dbg!("Error::LocalTxBufFull");
             return Err(Error::LocalTxBufFull);
         }
 
@@ -1749,7 +1673,6 @@ impl LocalTxBuf {
 
         self.tail += Wrapping(data_buf.len() as u32);
 
-        dbg!("self.tail: {}, self.head: {}", self.tail, self.head);
         Ok(())
     }
 
@@ -1759,8 +1682,6 @@ impl LocalTxBuf {
         if self.is_empty() {
             return Ok(0);
         }
-
-        dbg!("Flushing non-empty tx buffer");
 
         // if self.tail.0 > self.head.0 {
         //     // Data to be flushed lies between head and tail
@@ -1881,32 +1802,25 @@ impl VhostUserBackend for VhostUserVsockBackend {
 
         match device_event {
             RX_QUEUE_EVENT => {
-                // dbg!("RX_QUEUE_EVENT");
                 if thread.thread_backend.pending_rx() {
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             TX_QUEUE_EVENT => {
-                // dbg!("TX_QUEUE_EVENT");
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
-            EVT_QUEUE_EVENT => {
-                // dbg!("EVT_QUEUE_EVENT");
-            }
+            EVT_QUEUE_EVENT => {}
             BACKEND_EVENT => {
-                // dbg!("BACKEND_EVENT");
                 thread.process_backend_evt(evset);
                 thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
                 if thread.thread_backend.pending_rx() {
-                    // dbg!("BACKEND_EVENT: pending_rx");
                     thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
                 }
             }
             _ => {
-                dbg!("Unknown event");
                 return Err(Error::HandleUnknownEvent.into());
             }
         }
