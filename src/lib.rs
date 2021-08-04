@@ -58,6 +58,8 @@ mod packet;
 use packet::*;
 mod rxops;
 use rxops::*;
+mod rxqueue;
+use rxqueue::*;
 
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
@@ -214,60 +216,6 @@ impl VsockConfig {
     /// requests from the guest.
     pub fn get_socket_path(&self) -> &str {
         &self.socket
-    }
-}
-
-#[derive(Debug)]
-struct RxQueue {
-    queue: u8,
-}
-
-impl RxQueue {
-    fn new() -> Self {
-        RxQueue { queue: 0 as u8 }
-    }
-    fn enqueue(&mut self, op: RxOps) {
-        self.queue |= op.bitmask();
-    }
-
-    fn dequeue(&mut self) -> Option<RxOps> {
-        let op = match self.peek() {
-            Some(req) => {
-                self.queue = self.queue & (!req.clone().bitmask());
-                Some(req)
-            }
-            None => None,
-        };
-
-        op
-    }
-
-    fn peek(&self) -> Option<RxOps> {
-        if self.contains(RxOps::Request.bitmask()) {
-            return Some(RxOps::Request);
-        }
-        if self.contains(RxOps::Rw.bitmask()) {
-            return Some(RxOps::Rw);
-        }
-        if self.contains(RxOps::Response.bitmask()) {
-            return Some(RxOps::Response);
-        }
-        if self.contains(RxOps::CreditUpdate.bitmask()) {
-            return Some(RxOps::CreditUpdate);
-        }
-        if self.contains(RxOps::Rst.bitmask()) {
-            return Some(RxOps::Rst);
-        } else {
-            None
-        }
-    }
-
-    fn contains(&self, op: u8) -> bool {
-        (self.queue & op) != 0
-    }
-
-    fn pending_rx(&self) -> bool {
-        self.queue != 0
     }
 }
 
