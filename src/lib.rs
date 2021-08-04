@@ -1207,7 +1207,7 @@ impl VhostUserVsockThread {
                 queue.disable_notification().unwrap();
                 // TODO: This should not even occur as pending_rx is checked before
                 // calling this function, figure out why
-                let work = self.process_rx_queue(queue, vring_lock.clone())?;
+                self.process_rx_queue(queue, vring_lock.clone())?;
                 if !queue.enable_notification().unwrap() {
                     break;
                 }
@@ -1459,7 +1459,7 @@ impl VsockConnection {
                         self.rx_cnt += Wrapping(pkt.len());
                         self.last_fwd_cnt = self.fwd_cnt;
                     }
-                    Err(err) => {}
+                    Err(_) => {}
                 }
                 return Ok(());
             }
@@ -1638,9 +1638,6 @@ impl LocalTxBuf {
         if CONN_TX_BUF_SIZE as usize - self.len() < data_buf.len() {
             return Err(Error::LocalTxBufFull);
         }
-
-        let buf_len = data_buf.len();
-        let start = self.tail.0;
 
         // if self.tail.0 > self.head.0 {
         //     // Data to be pushed at the end of the buffer
