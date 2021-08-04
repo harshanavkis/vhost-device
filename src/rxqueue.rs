@@ -62,3 +62,97 @@ impl RxQueue {
         self.queue != 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contains() {
+        let mut rxqueue = RxQueue::new();
+        rxqueue.queue = 31;
+
+        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), true);
+        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), true);
+        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), true);
+        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
+        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), true);
+
+        rxqueue.queue = 0;
+        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), false);
+        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), false);
+        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), false);
+        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
+        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), false);
+    }
+
+    #[test]
+    fn test_enqueue() {
+        let mut rxqueue = RxQueue::new();
+
+        rxqueue.enqueue(RxOps::Request);
+        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), true);
+
+        rxqueue.enqueue(RxOps::Rw);
+        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), true);
+
+        rxqueue.enqueue(RxOps::Response);
+        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), true);
+
+        rxqueue.enqueue(RxOps::CreditUpdate);
+        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
+
+        rxqueue.enqueue(RxOps::Rst);
+        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), true);
+    }
+
+    #[test]
+    fn test_peek() {
+        let mut rxqueue = RxQueue::new();
+
+        rxqueue.queue = 31;
+        assert_eq!(rxqueue.peek(), Some(RxOps::Request));
+
+        rxqueue.queue = 30;
+        assert_eq!(rxqueue.peek(), Some(RxOps::Rw));
+
+        rxqueue.queue = 28;
+        assert_eq!(rxqueue.peek(), Some(RxOps::Response));
+
+        rxqueue.queue = 24;
+        assert_eq!(rxqueue.peek(), Some(RxOps::CreditUpdate));
+
+        rxqueue.queue = 16;
+        assert_eq!(rxqueue.peek(), Some(RxOps::Rst));
+    }
+
+    #[test]
+    fn test_dequeue() {
+        let mut rxqueue = RxQueue::new();
+        rxqueue.queue = 31;
+
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::Request));
+        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), false);
+
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::Rw));
+        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), false);
+
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::Response));
+        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), false);
+
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::CreditUpdate));
+        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
+
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::Rst));
+        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), false);
+    }
+
+    #[test]
+    fn test_pending_rx() {
+        let mut rxqueue = RxQueue::new();
+        assert_eq!(rxqueue.pending_rx(), false);
+
+        rxqueue.queue = 1;
+        assert_eq!(rxqueue.pending_rx(), true);
+    }
+}
