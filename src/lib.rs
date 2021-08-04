@@ -56,6 +56,8 @@ mod txbuf;
 use txbuf::*;
 mod packet;
 use packet::*;
+mod rxops;
+use rxops::*;
 
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
@@ -212,27 +214,6 @@ impl VsockConfig {
     /// requests from the guest.
     pub fn get_socket_path(&self) -> &str {
         &self.socket
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum RxOps {
-    /// VSOCK_OP_REQUEST
-    Request = 0,
-    /// VSOCK_OP_RW
-    Rw = 1,
-    /// VSOCK_OP_RESPONSE
-    Response = 2,
-    /// VSOCK_OP_CREDIT_UPDATE
-    CreditUpdate = 3,
-    /// VSOCK_OP_RST
-    Rst = 4,
-}
-
-impl RxOps {
-    /// Convert enum value into bitmask
-    fn bitmask(self) -> u8 {
-        1u8 << (self as u8)
     }
 }
 
