@@ -1,4 +1,4 @@
-# Crate Name
+# vhost-user-vsock
 
 ## Design
 
@@ -11,17 +11,57 @@ Some questions that might help in writing this section:
 
 ## Usage
 
-TODO: This section describes how the crate is used.
+Run the vhost-user-vsock device:
+```
+vhost_user_vsock --vsock-backend guest-cid=4,uds-path=/tmp/vm4.vsock,socket=/tmp/vhost4.socket
+```
 
-Some questions that might help in writing this section:
-- What traits do users need to implement?
-- Does the crate have any default/optional features? What is each feature
-  doing?
-- Is this crate used by other rust-vmm components? If yes, how?
+Run qemu:
 
-## Examples
+```
+qemu-system-x86_64 -drive file=/path/to/disk.qcow2 -enable-kvm -m 512M \
+  -smp 2 -vga virtio -chardev socket,id=char0,reconnect=0,path=/tmp/vhost4.socket \
+  -device vhost-user-vsock-pci,chardev=char0 \
+  -object memory-backend-file,share=on,id=mem,size="512M",mem-path="/dev/hugepages" \
+  -numa node,memdev=mem -mem-prealloc
+```
 
-TODO: Usage examples.
+### Guest listening
+
+#### iperf
+
+```sh
+# https://github.com/stefano-garzarella/iperf-vsock
+guest$ iperf3 --vsock -s
+host$  iperf3 --vsock -c /tmp/vm4.vsock
+```
+
+#### netcat
+
+```sh
+guest$ nc --vsock -l 1234
+
+host$  nc -U /tmp/vm4.vsock
+CONNECT 1234
+```
+
+### Host listening
+
+#### iperf
+
+```sh
+# https://github.com/stefano-garzarella/iperf-vsock
+host$  iperf3 --vsock -s -B /tmp/vm4.vsock
+guest$ iperf3 --vsock -c 2
+```
+
+#### netcat
+
+```sh
+host$ nc -l -U /tmp/vm4.vsock_1234
+
+guest$ nc --vsock 2 1234
+```
 
 ```rust
 use my_crate;
