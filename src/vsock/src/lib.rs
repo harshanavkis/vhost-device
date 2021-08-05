@@ -57,6 +57,7 @@ const EVT_QUEUE_EVENT: u16 = 2;
 const BACKEND_EVENT: u16 = 3;
 
 // Vsock connection TX buffer capacity
+// TODO: Make this value configurable
 const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
 // CID of the host
