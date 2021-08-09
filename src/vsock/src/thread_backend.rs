@@ -52,7 +52,7 @@ impl VsockThreadBackend {
     /// Checks if there are pending rx requests in the backend
     /// rxq
     pub fn pending_rx(&self) -> bool {
-        self.backend_rxq.len() != 0
+        !self.backend_rxq.is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver

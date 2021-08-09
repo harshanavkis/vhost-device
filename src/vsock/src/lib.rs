@@ -179,9 +179,9 @@ impl VsockConfig {
     /// parameters to be fed into the vsock-backend server
     pub fn new(guest_cid: u64, socket: String, uds_path: String) -> Self {
         VsockConfig {
-            guest_cid: guest_cid,
-            socket: socket,
-            uds_path: uds_path,
+            guest_cid,
+            socket,
+            uds_path,
         }
     }
 
@@ -235,9 +235,9 @@ impl VhostUserVsockBackend {
         threads.push(thread);
 
         Ok(Self {
-            guest_cid: guest_cid,
-            threads: threads,
-            queues_per_thread: queues_per_thread,
+            guest_cid,
+            threads,
+            queues_per_thread,
         })
     }
 }
@@ -302,21 +302,21 @@ impl VhostUserBackend for VhostUserVsockBackend {
         match device_event {
             RX_QUEUE_EVENT => {
                 if thread.thread_backend.pending_rx() {
-                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
+                    thread.process_rx(vring_rx_lock, evt_idx)?;
                 }
             }
             TX_QUEUE_EVENT => {
-                thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
+                thread.process_tx(vring_tx_lock, evt_idx)?;
                 if thread.thread_backend.pending_rx() {
-                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
+                    thread.process_rx(vring_rx_lock, evt_idx)?;
                 }
             }
             EVT_QUEUE_EVENT => {}
             BACKEND_EVENT => {
                 thread.process_backend_evt(evset);
-                thread.process_tx(vring_tx_lock.clone(), evt_idx)?;
+                thread.process_tx(vring_tx_lock, evt_idx)?;
                 if thread.thread_backend.pending_rx() {
-                    thread.process_rx(vring_rx_lock.clone(), evt_idx)?;
+                    thread.process_rx(vring_rx_lock, evt_idx)?;
                 }
             }
             _ => {

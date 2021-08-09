@@ -20,15 +20,13 @@ impl RxQueue {
 
     /// Dequeue an rx operation from the queue
     pub fn dequeue(&mut self) -> Option<RxOps> {
-        let op = match self.peek() {
+        match self.peek() {
             Some(req) => {
-                self.queue = self.queue & (!req.clone().bitmask());
+                self.queue &= !req.clone().bitmask();
                 Some(req)
             }
             None => None,
-        };
-
-        op
+        }
     }
 
     /// Peek into the queue to check if it contains an rx operation
@@ -46,7 +44,7 @@ impl RxQueue {
             return Some(RxOps::CreditUpdate);
         }
         if self.contains(RxOps::Rst.bitmask()) {
-            return Some(RxOps::Rst);
+            Some(RxOps::Rst)
         } else {
             None
         }

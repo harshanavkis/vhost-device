@@ -76,7 +76,7 @@ impl VhostUserVsockThread {
             host_listener: host_sock,
             kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             vring_worker: None,
-            epoll_file: epoll_file,
+            epoll_file,
             thread_backend: VsockThreadBackend::new(uds_path, epoll_fd),
             guest_cid,
             pool: ThreadPoolBuilder::new()
@@ -155,10 +155,10 @@ impl VhostUserVsockThread {
         'epoll: loop {
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
-                    for i in 0..ev_cnt {
+                    for evt in epoll_events.iter().take(ev_cnt) {
                         self.handle_event(
-                            epoll_events[i].data as RawFd,
-                            epoll::Events::from_bits(epoll_events[i].events).unwrap(),
+                            evt.data as RawFd,
+                            epoll::Events::from_bits(evt.events).unwrap(),
                         );
                     }
                 }
@@ -269,7 +269,7 @@ impl VhostUserVsockThread {
 
                 // TODO: This probably always evaluates to true in this block
                 let connected = vsock_conn.connect;
-                if connected.clone() {
+                if connected {
                     // Unregister stream from the epoll, register when connection is
                     // established with the guest
                     Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();

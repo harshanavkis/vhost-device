@@ -67,7 +67,7 @@ impl VsockConnection {
         epoll_fd: RawFd,
     ) -> Self {
         Self {
-            stream: stream,
+            stream,
             connect: false,
             peer_port: guest_port,
             rx_queue: RxQueue::new(),
@@ -99,16 +99,16 @@ impl VsockConnection {
         let mut rx_queue = RxQueue::new();
         rx_queue.enqueue(RxOps::Response);
         Self {
-            stream: stream,
+            stream,
             connect: false,
             peer_port: guest_port,
-            rx_queue: rx_queue,
+            rx_queue,
             local_cid,
             local_port,
             guest_cid,
             fwd_cnt: Wrapping(0),
             last_fwd_cnt: Wrapping(0),
-            peer_buf_alloc: peer_buf_alloc,
+            peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             epoll_fd,
@@ -132,7 +132,7 @@ impl VsockConnection {
             Some(RxOps::Request) => {
                 // Send a connection request to the guest-side application
                 pkt.set_op(VSOCK_OP_REQUEST);
-                return Ok(());
+                Ok(())
             }
             Some(RxOps::Rw) => {
                 if !self.connect {
@@ -157,42 +157,37 @@ impl VsockConnection {
                 let max_read_len = std::cmp::min(buf.len(), self.peer_avail_credit());
 
                 // Read data from the stream directly into the buffer
-                match self.stream.read(&mut buf[..max_read_len]) {
-                    Ok(read_cnt) => {
-                        if read_cnt == 0 {
-                            // If no data was read then the stream was closed down unexpectedly.
-                            // Send a shutdown packet to the guest-side application.
-                            pkt.set_op(VSOCK_OP_SHUTDOWN)
-                                .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
-                                .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
-                        } else {
-                            // If data was read, then set the length field in the packet header
-                            // to the amount of data that was read.
-                            pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
+                if let Ok(read_cnt) = self.stream.read(&mut buf[..max_read_len]) {
+                    if read_cnt == 0 {
+                        // If no data was read then the stream was closed down unexpectedly.
+                        // Send a shutdown packet to the guest-side application.
+                        pkt.set_op(VSOCK_OP_SHUTDOWN)
+                            .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
+                            .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
+                    } else {
+                        // If data was read, then set the length field in the packet header
+                        // to the amount of data that was read.
+                        pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
 
-                            // Re-register the stream file descriptor for read and write events
-                            match VhostUserVsockThread::epoll_register(
-                                self.epoll_fd,
-                                self.stream.as_raw_fd(),
-                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                            ) {
-                                _ => {}
-                            };
-                        }
-
-                        // Update the rx_cnt with the amount of data in the vsock packet.
-                        self.rx_cnt += Wrapping(pkt.len());
-                        self.last_fwd_cnt = self.fwd_cnt;
+                        // Re-register the stream file descriptor for read and write events
+                        VhostUserVsockThread::epoll_register(
+                            self.epoll_fd,
+                            self.stream.as_raw_fd(),
+                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                        )?;
                     }
-                    Err(_) => {}
+
+                    // Update the rx_cnt with the amount of data in the vsock packet.
+                    self.rx_cnt += Wrapping(pkt.len());
+                    self.last_fwd_cnt = self.fwd_cnt;
                 }
-                return Ok(());
+                Ok(())
             }
             Some(RxOps::Response) => {
                 // A response has been received to a newly initiated host-side connection
                 self.connect = true;
                 pkt.set_op(VSOCK_OP_RESPONSE);
-                return Ok(());
+                Ok(())
             }
             Some(RxOps::CreditUpdate) => {
                 // Request credit update from the guest.
@@ -201,11 +196,9 @@ impl VsockConnection {
                     pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
                     self.last_fwd_cnt = self.fwd_cnt;
                 }
-                return Ok(());
+                Ok(())
             }
-            _ => {
-                return Err(Error::NoRequestRx);
-            }
+            _ => Err(Error::NoRequestRx),
         }
     }
 
@@ -222,7 +215,7 @@ impl VsockConnection {
             // Confirmation for a host initiated connection
             // TODO: Handle stream write error in a better manner
             let response = format!("OK {}\n", self.peer_port);
-            self.stream.write(response.as_bytes()).unwrap();
+            self.stream.write_all(response.as_bytes()).unwrap();
             self.connect = true;
         } else if pkt.op() == VSOCK_OP_RW {
             // Data has to be written to the host-side stream
@@ -244,20 +237,19 @@ impl VsockConnection {
             // Already updated the credit
 
             // Re-register the stream file descriptor for read and write events
-            match VhostUserVsockThread::epoll_modify(
+            if VhostUserVsockThread::epoll_modify(
                 self.epoll_fd,
                 self.stream.as_raw_fd(),
                 epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-            ) {
-                Err(_) => {
-                    VhostUserVsockThread::epoll_register(
-                        self.epoll_fd,
-                        self.stream.as_raw_fd(),
-                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                    )
-                    .unwrap();
-                }
-                _ => {}
+            )
+            .is_err()
+            {
+                VhostUserVsockThread::epoll_register(
+                    self.epoll_fd,
+                    self.stream.as_raw_fd(),
+                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                )
+                .unwrap();
             };
         } else if pkt.op() == VSOCK_OP_CREDIT_REQUEST {
             // Send back this connection's credit information
@@ -267,10 +259,8 @@ impl VsockConnection {
             let recv_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_RCV != 0;
             let send_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
-            if recv_off && send_off {
-                if self.tx_buf.is_empty() {
-                    self.rx_queue.enqueue(RxOps::Rst);
-                }
+            if recv_off && send_off && self.tx_buf.is_empty() {
+                self.rx_queue.enqueue(RxOps::Rst);
             }
         }
 
