@@ -2,8 +2,8 @@
 name = "vhost-user-vsock"
 version = "0.1.0"
 authors = ["Harshavardhan Unnibhavi <harshanavkis@gmail.com>"]
-description = "This is a template for creating rust-vmm repositories."
-repository = "https://github.com/rust-vmm/crate-template"
+description = "A virtio-vsock device using the vhost-user protocol."
+repository = "https://github.com/rust-vmm/vhost-device"
 readme = "README.md"
 keywords = ["vhost", "vsock"]
 license = "Apache-2.0 OR BSD-3-Clause"
