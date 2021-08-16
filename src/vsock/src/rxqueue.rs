@@ -43,8 +43,8 @@ impl RxQueue {
         if self.contains(RxOps::CreditUpdate.bitmask()) {
             return Some(RxOps::CreditUpdate);
         }
-        if self.contains(RxOps::Rst.bitmask()) {
-            Some(RxOps::Rst)
+        if self.contains(RxOps::Reset.bitmask()) {
+            Some(RxOps::Reset)
         } else {
             None
         }
@@ -74,14 +74,14 @@ mod tests {
         assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), true);
         assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), true);
         assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
-        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), true);
+        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), true);
 
         rxqueue.queue = 0;
         assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), false);
         assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), false);
         assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), false);
         assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
-        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), false);
+        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), false);
     }
 
     #[test]
@@ -100,8 +100,8 @@ mod tests {
         rxqueue.enqueue(RxOps::CreditUpdate);
         assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
 
-        rxqueue.enqueue(RxOps::Rst);
-        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), true);
+        rxqueue.enqueue(RxOps::Reset);
+        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), true);
     }
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(rxqueue.peek(), Some(RxOps::CreditUpdate));
 
         rxqueue.queue = 16;
-        assert_eq!(rxqueue.peek(), Some(RxOps::Rst));
+        assert_eq!(rxqueue.peek(), Some(RxOps::Reset));
     }
 
     #[test]
@@ -141,8 +141,8 @@ mod tests {
         assert_eq!(rxqueue.dequeue(), Some(RxOps::CreditUpdate));
         assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
 
-        assert_eq!(rxqueue.dequeue(), Some(RxOps::Rst));
-        assert_eq!(rxqueue.contains(RxOps::Rst.bitmask()), false);
+        assert_eq!(rxqueue.dequeue(), Some(RxOps::Reset));
+        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), false);
     }
 
     #[test]

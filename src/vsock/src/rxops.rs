@@ -11,7 +11,7 @@ pub enum RxOps {
     /// VSOCK_OP_CREDIT_UPDATE
     CreditUpdate = 3,
     /// VSOCK_OP_RST
-    Rst = 4,
+    Reset = 4,
 }
 
 impl RxOps {

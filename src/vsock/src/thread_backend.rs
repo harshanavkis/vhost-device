@@ -72,7 +72,7 @@ impl VsockThreadBackend {
             }
         };
 
-        if conn.rx_queue.peek() == Some(RxOps::Rst) {
+        if conn.rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
@@ -148,7 +148,7 @@ impl VsockThreadBackend {
         if pkt.op() == VSOCK_OP_RST {
             // Handle an RST packet from the guest here
             let conn = self.conn_map.get(&key).unwrap();
-            if conn.rx_queue.contains(RxOps::Rst.bitmask()) {
+            if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
                 return Ok(());
             }
             let conn = self.conn_map.remove(&key).unwrap();

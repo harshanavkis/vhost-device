@@ -260,7 +260,7 @@ impl VsockConnection {
             let send_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
             if recv_off && send_off && self.tx_buf.is_empty() {
-                self.rx_queue.enqueue(RxOps::Rst);
+                self.rx_queue.enqueue(RxOps::Reset);
             }
         }
 
