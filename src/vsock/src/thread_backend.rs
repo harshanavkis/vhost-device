@@ -12,6 +12,7 @@ use super::Result;
 use super::VhostUserVsockThread;
 use super::{VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST, VSOCK_TYPE_STREAM};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::AsRawFd;
@@ -32,6 +33,8 @@ pub struct VsockThreadBackend {
     host_socket_path: String,
     /// epoll for registering new host-side connections
     epoll_fd: i32,
+    /// Set of allocated local ports
+    pub local_port_set: HashSet<u32>,
 }
 
 impl VsockThreadBackend {
@@ -46,6 +49,7 @@ impl VsockThreadBackend {
             stream_map: HashMap::new(),
             host_socket_path,
             epoll_fd,
+            local_port_set: HashSet::new(),
         }
     }
 
@@ -77,6 +81,7 @@ impl VsockThreadBackend {
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
+            self.local_port_set.remove(&conn.local_port);
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
@@ -154,6 +159,7 @@ impl VsockThreadBackend {
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
             self.stream_map.remove(&conn.stream.as_raw_fd());
+            self.local_port_set.remove(&conn.local_port);
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
@@ -208,13 +214,13 @@ impl VsockThreadBackend {
             pkt.buf_alloc(),
         );
 
-        // vsock_conn.connect = true;
         self.conn_map
             .insert(ConnMapKey::new(pkt.dst_port(), pkt.src_port()), vsock_conn);
         self.backend_rxq
             .push_back(ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
         self.stream_map
             .insert(stream_fd, unsafe { UnixStream::from_raw_fd(stream_fd) });
+        self.local_port_set.insert(pkt.dst_port());
 
         VhostUserVsockThread::epoll_register(
             self.epoll_fd,

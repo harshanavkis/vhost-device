@@ -149,6 +149,8 @@ pub enum Error {
     LocalTxBufFull,
     /// Unable to flush data from local tx buffer
     LocalTxBufFlush(std::io::Error),
+    /// No free local port available for new host inititated connection
+    NoFreeLocalPort,
 }
 
 impl fmt::Display for Error {

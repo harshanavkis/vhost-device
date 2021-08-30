@@ -53,7 +53,7 @@ pub struct VhostUserVsockThread {
     /// Thread pool to handle event idx
     pool: ThreadPool,
     /// host side port on which application listens
-    local_port: u32,
+    local_port: Wrapping<u32>,
 }
 
 impl VhostUserVsockThread {
@@ -83,7 +83,7 @@ impl VhostUserVsockThread {
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
-            local_port: 0,
+            local_port: Wrapping(0),
         };
 
         VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
@@ -207,7 +207,12 @@ impl VhostUserVsockThread {
                 let peer_port = Self::read_local_stream_port(&mut unix_stream).unwrap();
 
                 // Allocate a local port number
-                let local_port = self.allocate_local_port();
+                let local_port = match self.allocate_local_port() {
+                    Ok(lp) => lp,
+                    Err(_) => {
+                        return;
+                    }
+                };
 
                 // Insert the fd into the backend's maps
                 self.thread_backend
@@ -286,9 +291,28 @@ impl VhostUserVsockThread {
     }
 
     /// Allocate a new local port number
-    fn allocate_local_port(&mut self) -> u32 {
-        self.local_port += 1;
-        self.local_port
+    fn allocate_local_port(&mut self) -> Result<u32> {
+        // TODO: Improve space efficiency of this operation
+        // TODO: Reuse the conn_map HashMap
+        let mut alloc_local_port = self.local_port.0;
+        loop {
+            if !self
+                .thread_backend
+                .local_port_set
+                .contains(&alloc_local_port)
+            {
+                // The port set doesn't contain the newly allocated port number.
+                self.local_port = Wrapping(alloc_local_port + 1);
+                self.thread_backend.local_port_set.insert(alloc_local_port);
+                return Ok(alloc_local_port);
+            } else {
+                if alloc_local_port == self.local_port.0 {
+                    // We have exhausted our search and wrapped back to the current port number
+                    return Err(Error::NoFreeLocalPort);
+                }
+                alloc_local_port += 1;
+            }
+        }
     }
 
     /// Read `CONNECT PORT_NUM\n` from the connected stream
