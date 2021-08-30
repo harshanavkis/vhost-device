@@ -10,7 +10,7 @@ pub struct RxQueue {
 impl RxQueue {
     /// new instance of RxQueue
     pub fn new() -> Self {
-        RxQueue { queue: 0 as u8 }
+        RxQueue { queue: 0_u8 }
     }
 
     /// Enqueue a new rx operation into the queue
@@ -22,7 +22,7 @@ impl RxQueue {
     pub fn dequeue(&mut self) -> Option<RxOps> {
         match self.peek() {
             Some(req) => {
-                self.queue &= !req.clone().bitmask();
+                self.queue &= !req.bitmask();
                 Some(req)
             }
             None => None,
@@ -70,18 +70,18 @@ mod tests {
         let mut rxqueue = RxQueue::new();
         rxqueue.queue = 31;
 
-        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), true);
-        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), true);
-        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), true);
-        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
-        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::Request.bitmask()));
+        assert!(rxqueue.contains(RxOps::Rw.bitmask()));
+        assert!(rxqueue.contains(RxOps::Response.bitmask()));
+        assert!(rxqueue.contains(RxOps::CreditUpdate.bitmask()));
+        assert!(rxqueue.contains(RxOps::Reset.bitmask()));
 
         rxqueue.queue = 0;
-        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), false);
-        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), false);
-        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), false);
-        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
-        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::Request.bitmask()));
+        assert!(!rxqueue.contains(RxOps::Rw.bitmask()));
+        assert!(!rxqueue.contains(RxOps::Response.bitmask()));
+        assert!(!rxqueue.contains(RxOps::CreditUpdate.bitmask()));
+        assert!(!rxqueue.contains(RxOps::Reset.bitmask()));
     }
 
     #[test]
@@ -89,19 +89,19 @@ mod tests {
         let mut rxqueue = RxQueue::new();
 
         rxqueue.enqueue(RxOps::Request);
-        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::Request.bitmask()));
 
         rxqueue.enqueue(RxOps::Rw);
-        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::Rw.bitmask()));
 
         rxqueue.enqueue(RxOps::Response);
-        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::Response.bitmask()));
 
         rxqueue.enqueue(RxOps::CreditUpdate);
-        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::CreditUpdate.bitmask()));
 
         rxqueue.enqueue(RxOps::Reset);
-        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), true);
+        assert!(rxqueue.contains(RxOps::Reset.bitmask()));
     }
 
     #[test]
@@ -130,27 +130,27 @@ mod tests {
         rxqueue.queue = 31;
 
         assert_eq!(rxqueue.dequeue(), Some(RxOps::Request));
-        assert_eq!(rxqueue.contains(RxOps::Request.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::Request.bitmask()));
 
         assert_eq!(rxqueue.dequeue(), Some(RxOps::Rw));
-        assert_eq!(rxqueue.contains(RxOps::Rw.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::Rw.bitmask()));
 
         assert_eq!(rxqueue.dequeue(), Some(RxOps::Response));
-        assert_eq!(rxqueue.contains(RxOps::Response.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::Response.bitmask()));
 
         assert_eq!(rxqueue.dequeue(), Some(RxOps::CreditUpdate));
-        assert_eq!(rxqueue.contains(RxOps::CreditUpdate.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::CreditUpdate.bitmask()));
 
         assert_eq!(rxqueue.dequeue(), Some(RxOps::Reset));
-        assert_eq!(rxqueue.contains(RxOps::Reset.bitmask()), false);
+        assert!(!rxqueue.contains(RxOps::Reset.bitmask()));
     }
 
     #[test]
     fn test_pending_rx() {
         let mut rxqueue = RxQueue::new();
-        assert_eq!(rxqueue.pending_rx(), false);
+        assert!(!rxqueue.pending_rx());
 
         rxqueue.queue = 1;
-        assert_eq!(rxqueue.pending_rx(), true);
+        assert!(rxqueue.pending_rx());
     }
 }

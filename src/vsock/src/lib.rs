@@ -232,8 +232,7 @@ impl VhostUserVsockBackend {
     fn new(guest_cid: u64, uds_path: String) -> Result<Self> {
         let mut threads = Vec::new();
         let thread = Mutex::new(VhostUserVsockThread::new(uds_path, guest_cid).unwrap());
-        let mut queues_per_thread = Vec::new();
-        queues_per_thread.push(0b11);
+        let queues_per_thread = vec![0b11];
         threads.push(thread);
 
         Ok(Self {

@@ -195,7 +195,9 @@ impl VhostUserVsockThread {
         } else {
             // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
-            if !self.thread_backend.listener_map.contains_key(&fd) {
+            if let std::collections::hash_map::Entry::Vacant(_) =
+                self.thread_backend.listener_map.entry(fd)
+            {
                 // New connection from the host
                 if evset != epoll::Events::EPOLLIN {
                     // Has to be EPOLLIN as it was not connected previously

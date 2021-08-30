@@ -27,7 +27,7 @@ fn main() {
 
     let guest_cid = match vsock_args.value_of("guest-cid") {
         Some(cid) => cid.parse().unwrap(),
-        None => 3 as u64,
+        None => 3_u64,
     };
 
     let socket = vsock_args.value_of("socket").unwrap();
