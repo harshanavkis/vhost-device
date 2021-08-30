@@ -41,7 +41,7 @@ the crate are split into various files as described below:
 
 Run the vhost-user-vsock device:
 ```
-vhost_user_vsock --vsock-backend guest-cid=4,uds-path=/tmp/vm4.vsock,socket=/tmp/vhost4.socket
+vhost_user_vsock --guest-cid=4 --uds-path=/tmp/vm4.vsock --socket=/tmp/vhost4.socket
 ```
 
 Run qemu:

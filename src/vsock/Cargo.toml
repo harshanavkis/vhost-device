@@ -10,8 +10,7 @@ license = "Apache-2.0 OR BSD-3-Clause"
 edition = "2018"
 
 [dependencies]
-clap = "2"
-option_parser = { git = "https://github.com/cloud-hypervisor/cloud-hypervisor.git" }
+clap = "2.33.3"
 vhost-user-backend = { git = "https://github.com/rust-vmm/vhost-user-backend" }
 virtio-bindings = { version = "0.1", features = ["virtio-v5_0_0"]}
 vhost = { git = "https://github.com/rust-vmm/vhost" }
